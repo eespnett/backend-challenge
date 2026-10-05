@@ -3,6 +3,7 @@ import { FinancialUnitOfWork, TransactionManager } from '../../application/finan
 import { IsolationLevel } from '@mikro-orm/core';
 import { InfrastructureUnavailableError } from '../../application/processing-errors';
 import { MikroOrmWalletRepository, MikroOrmWagerTransactionRepository, MikroOrmLedgerRepository, MikroOrmOutboxRepository } from './repositories';
+import { MikroOrmPendingReferenceRepository } from './pending-reference-repository';
 
 export function isTransientDatabaseError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -22,7 +23,7 @@ export class MikroOrmTransactionManager implements TransactionManager {
         await em.execute("set local statement_timeout = '15s'");
         return work({ wallets: new MikroOrmWalletRepository(em),
           transactions: new MikroOrmWagerTransactionRepository(em), ledger: new MikroOrmLedgerRepository(em),
-          outbox: new MikroOrmOutboxRepository(em) });
+          outbox: new MikroOrmOutboxRepository(em), pendingReferences: new MikroOrmPendingReferenceRepository(em) });
       }, { isolationLevel: IsolationLevel.READ_COMMITTED });
     } catch (error) {
       if (isTransientDatabaseError(error)) throw new InfrastructureUnavailableError();

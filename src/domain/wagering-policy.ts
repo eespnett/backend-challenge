@@ -57,7 +57,7 @@ export class WageringPolicy {
     const direction = transaction.ledgerDirectionFor(reference);
     if (direction === LedgerDirection.Debit && wallet.balance.isLessThan(transaction.money)) {
       return reject(transaction.kind === Kind.Rollback
-        ? FailureCode.ReversalInsufficientBalance : FailureCode.InsufficientBalance);
+        ? FailureCode.ReversalInsufficientFunds : FailureCode.InsufficientBalance);
     }
     return Object.freeze({ outcome: 'APPLY', direction: transaction.affectsBalance() ? direction : undefined,
       money: transaction.money, referenceTransactionId: reference?.id });

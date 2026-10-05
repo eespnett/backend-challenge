@@ -52,6 +52,12 @@ export class MikroOrmWalletRepository implements WalletRepository {
 
 export class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
   constructor(private readonly em: EntityManager) {}
+  async saveState(tx: WagerTransaction): Promise<void> {
+    const entity = await this.em.findOneOrFail(WagerTransactionEntity, { id: tx.id });
+    this.em.assign(entity, { status: tx.status, referenceTransactionId: tx.referenceTransactionId ?? null,
+      failureCode: tx.failureCode ?? null, processedAt: tx.processedAt ?? null });
+    await this.em.flush();
+  }
   async add(tx: WagerTransaction, result?: StoredProcessingResult): Promise<void> {
     const entity = WagerTransactionMapper.toPersistence(tx);
     entity.resultHttpStatus = result?.httpStatus ?? null;

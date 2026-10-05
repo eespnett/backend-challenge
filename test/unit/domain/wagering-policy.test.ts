@@ -92,7 +92,7 @@ describe('WageringPolicy financial rules', () => {
   test.each([Kind.Win, Kind.Refund])('ROLLBACK of %s cannot make the wallet negative', (kind) => {
     const aggregate = wallet('24.99');
     const result = applyDecision(aggregate, reversal(Kind.Rollback), { reference: reference(kind) });
-    expect(result.decision).toEqual(rejected(FailureCode.ReversalInsufficientBalance));
+    expect(result.decision).toEqual(rejected(FailureCode.ReversalInsufficientFunds));
     expect(result.entry).toBeUndefined();
     expect(aggregate.balance.toString()).toBe('24.99');
     expect(aggregate.version).toBe(1);

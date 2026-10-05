@@ -47,6 +47,7 @@ services:
       AWS_ACCESS_KEY_ID: test
       AWS_SECRET_ACCESS_KEY: test
       SQS_ENDPOINT: http://localstack:4566
+      PENDING_REFERENCE_WORKER_ENABLED: "${PENDING_REFERENCE_WORKER_ENABLED:-true}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -111,7 +111,7 @@ describe('Phase 3 processing via HTTP and real PostgreSQL', () => {
     const before = await h.state(wallet.id);
     const result = await h.post(wagerBody(wallet, Kind.Rollback, '80.00', { referenceExternalTransactionId: win.externalTransactionId }));
     expect(result.httpStatus).toBe(422);
-    expect(result.body.failureCode).toBe('REVERSAL_INSUFFICIENT_BALANCE');
+    expect(result.body.failureCode).toBe('REVERSAL_INSUFFICIENT_FUNDS');
     expect(await h.state(wallet.id)).toEqual({ ...before, transactions: '3', outbox: '5' });
   });
 
@@ -308,6 +308,7 @@ describe('Phase 3 processing via HTTP and real PostgreSQL', () => {
       const rejected = await new ProcessWagerTransactionUseCase(manager).execute(
         wagerBody(wallet,Kind.Bet,'25.00',{money:{amount:'25.00',currency:'USD'}}),crypto.randomUUID());
       expect(rejected.httpStatus).toBe(422);
+      await fixture.orm.getMigrator().down(); // Phase 5 has no incompatible codes in this fixture.
       await expect(fixture.orm.getMigrator().down()).rejects.toThrow();
       const connection=fixture.orm.em.getConnection();
       expect(await connection.execute('select result_http_status,result_body from wagering.wager_transactions where id=?',[rejected.body.transactionId]))

@@ -1,4 +1,4 @@
-# Arquitetura — Fases 0, 1, 2, 3 e 4
+# Arquitetura — Fases 0, 1, 2, 3, 4 e 5
 
 ## Escopo implementado
 
@@ -10,11 +10,13 @@ A Fase 3 processa operações via POST /wagering/transactions com lock por walle
 idempotência persistente, resposta original e outbox na mesma transação SQL.
 A Fase 4 testa concorrência HTTP com três processos Bun independentes, restart,
 stress controlado e locks observados diretamente no PostgreSQL.
-Ainda não há autenticação, consumidor, inbox, publisher ou workers de negócio.
+A Fase 5 resolve referências pendentes com worker periódico, agendamento e
+claim/lease persistidos. Ainda não há autenticação, consumidor SQS, inbox ou publisher.
 
 A migration 20261005000000 cria o schema wagering; 20261005020000 cria as três
 tabelas financeiras, constraints, índices e proteção do ledger. A migration
-20261005030000 acrescenta resultados originais e outbox. O histórico de migrations
+20261005030000 acrescenta resultados originais e outbox; 20261005050000 cria
+pending_reference_jobs e amplia os códigos de rejeição. O histórico de migrations
 fica em public; migrations executam em transação. O rollback não usa CASCADE. O search_path da conexão fica em public para
 impedir que o schema homônimo do usuário receba o histórico.
 O serviço migrate executa uma vez antes da aplicação no Compose.
@@ -197,13 +199,15 @@ geral das reversões e controle de concorrência pertencem à fase de processame
 | CURRENCY_MISMATCH | operação entre moedas diferentes |
 | INVALID_WALLET_STATE | saldo, versão, identificadores ou data inválidos |
 | INSUFFICIENT_BALANCE | BET ou débito direto sem saldo |
-| REVERSAL_INSUFFICIENT_BALANCE | reversão de crédito produziria saldo negativo |
+| REVERSAL_INSUFFICIENT_FUNDS | reversão de crédito produziria saldo negativo |
+| REVERSAL_INSUFFICIENT_BALANCE | código histórico mantido para reidratação/replay |
 | INVALID_LEDGER_ENTRY | fatos ou aritmética inválidos |
 | INVALID_TRANSACTION | metadados, kind ou valor inválidos |
 | INVALID_TRANSACTION_STATE | transição proibida ou estado persistido inconsistente |
 | OPENING_INTERNAL_ONLY | tentativa externa de OPENING ou aplicação duplicada da abertura |
 | REFERENCE_REQUIRED | contrato de reversão sem referência |
-| REFERENCE_NOT_FOUND | reservado para rejeição após expiração futura da espera |
+| REFERENCE_NOT_FOUND | prazo expirado sem referência do provider solicitado |
+| REFERENCE_NOT_PROCESSABLE | prazo expirado com referência existente |
 | INVALID_REFERENCE | identidade, kind, estado ou vínculo inválido |
 | REFERENCE_AMOUNT_MISMATCH | reversão diferente do valor integral original |
 | DUPLICATE_REVERSAL | referência já revertida pelo mesmo tipo |
@@ -546,3 +550,131 @@ locks e fronteira transacional permanecem os da Fase 3.
 Não foram implementados consumer SQS, inbox, publisher, worker de referências,
 autenticação ou observabilidade completa. O teste de reinício ocorre após resposta
 e commit confirmados; crash durante commit/ack de mensagens é escopo das fases futuras.
+
+## Referências pendentes — Fase 5
+
+### Agendamento e estados
+
+Quando a política retorna PENDING_REFERENCE, o fluxo HTTP grava transação,
+resultado original 202, WagerTransactionPendingReference e pending_reference_jobs
+na mesma transação SQL. Não altera saldo/version nem cria ledger. Replay não
+agenda novamente nem insere outro evento. UNIQUE(transaction_id,event_type)
+continua protegendo a outbox; transaction_id é a PK da pendência.
+
+pending_reference_jobs tem FK composta transaction_id/wallet_id, status,
+attempts, next_attempt_at, created_at, expires_at, updated_at, completed_at,
+lease_token UUID, lease_owner, lease_until, correlation_id e causation_id.
+CHECKs protegem TTL de exatamente 15 minutos, contador não negativo, prazo de
+retry dentro do TTL e combinação de lease/conclusão com o estado. Índices
+parciais cobrem READY por next_attempt_at e CLAIMED por lease_until.
+A migration faz backfill dos PENDING_REFERENCE existentes sem reescrever
+respostas ou emitir eventos duplicados; usa created_at da transação como origem
+do TTL dos registros históricos. Não modifica migrations anteriores.
+
+```mermaid
+stateDiagram-v2
+  [*] --> READY: pendência persistida
+  READY --> CLAIMED: próxima tentativa vencida
+  CLAIMED --> READY: referência ainda pendente, backoff
+  CLAIMED --> CLAIMED: lease vencido, novo token/worker
+  CLAIMED --> COMPLETED: PROCESSED ou REJECTED
+  CLAIMED --> EXPIRED: REJECTED após TTL
+```
+
+Primeira tentativa: 1s depois da criação. O claim incrementa attempts, inclusive
+quando o processo cai antes da conclusão. Se ainda precisar aguardar, o próximo
+intervalo é 2s, 4s, 8s, 16s, 30s e depois 30s; next_attempt_at é limitado por
+expires_at. O TTL nunca é estendido por tentativas, leases ou reinícios.
+Agendamento/claim e verificação de lease usam o relógio do PostgreSQL.
+Uma pendência observada depois do TTL não aplica efeito, mesmo se a referência
+aparecer tarde: REFERENCE_NOT_FOUND se ausente no provider solicitado;
+REFERENCE_NOT_PROCESSABLE se existir. Ambos terminam a transação como REJECTED
+e a pendência como EXPIRED. Infraestrutura indisponível pode atrasar essa
+verificação; o vencimento persistido permanece o mesmo.
+
+### Claim, lease e fronteira financeira
+
+MikroOrmPendingReferenceClaimStore abre uma transação curta. Uma CTE seleciona
+READY vencidas ou CLAIMED com lease vencido usando FOR UPDATE SKIP LOCKED,
+e um UPDATE atribui token gen_random_uuid(), owner PID/UUID, lease de 30s e
+incrementa attempts. O commit do claim ocorre antes da execução financeira.
+Cada lote contém até cinco pendências e executa reprocessamentos em paralelo.
+
+ReprocessPendingReferenceUseCase abre outra transação READ COMMITTED, bloqueia
+wallet com PESSIMISTIC_WRITE e depois a pendência com FOR UPDATE, exigindo token
+atual e lease válido. Um worker que ficou aguardando a wallet depois de perder
+o lease retorna STALE, sem efeitos. O lock da pendência fica até commit: mesmo
+se o lease vencer durante a aplicação, SKIP LOCKED impede um novo claim enquanto
+essa transação ainda estiver ativa. A autoridade é o banco, nunca cache local.
+A ordem wallet -> pendência evita manter a linha da pendência bloqueada enquanto
+um worker aguarda wallet; o claim curto não tenta bloquear wallet.
+
+Sob esses locks, a mesma WageringPolicy revalida provider/id externo, player,
+wallet, moeda, round, kind, status, valor da reversão, reversões PROCESSED do
+mesmo tipo e saldo disponível. REFUND aceita apenas BET PROCESSED de igual
+valor; ROLLBACK inverte BET/WIN/REFUND processada e usa
+REVERSAL_INSUFFICIENT_FUNDS se o débito resultante exceder o saldo.
+O código anterior REVERSAL_INSUFFICIENT_BALANCE continua aceito somente para
+compatibilidade com auditorias e respostas históricas.
+
+Ainda-pendente retorna a READY sem alterar transação, wallet, ledger ou eventos.
+Resolução muda apenas os campos de estado da transação, grava o ledger se houve
+movimento, persiste eventos finais e conclui a pendência no mesmo commit.
+WagerTransactionProcessed/WagerTransactionRejected são persistidos uma vez;
+WalletBalanceChanged só existe quando saldo muda. O evento PendingReference
+inicial permanece único. Também é mantido o comportamento anterior de WIN
+com referência opcional, quando essa operação entra em PENDING_REFERENCE.
+
+O resultado HTTP original é imutável: uma key originalmente aceita como 202
+continua retornando esse 202 e o saldo observado originalmente, mesmo após
+PROCESSED/REJECTED. O estado atual está na transação e nos eventos da outbox.
+Não foi adicionado endpoint de consulta nem publicação de eventos nesta fase.
+
+### Worker e recuperação
+
+PendingReferencesModule registra um worker em cada instância da aplicação.
+Ele consulta a cada segundo, não sobrepõe lotes locais e usa owner independente
+por processo/bootstrap. PENDING_REFERENCE_WORKER_ENABLED=true é o default;
+false desabilita somente o polling, inclusive no Compose. O shutdown interrompe
+novos ticks e aguarda o lote ativo. Avisos de falha não expõem SQL/payloads.
+Falha de claim é tentada no próximo tick. Falha financeira faz rollback completo;
+o lease já persistido continua disponível para recuperação após vencer.
+Não há renovação/heartbeat: locks e token garantem exclusão e recuperação.
+
+Queda depois do claim deixa CLAIMED recuperável. Queda durante aplicação reverte
+wallet/transação/ledger/outbox/conclusão juntos. Queda depois de commit encontra
+COMPLETED/EXPIRED e não reaplica. Em falhas de conexão com resultado de commit
+incerto, o estado persistido da pendência impede repetir um efeito já confirmado
+pelo banco. Nenhuma chamada de rede/publisher ocorre na transação financeira.
+
+### Validação e limites
+
+```sh
+bun run typecheck
+bun test test/unit
+bun run test:integration
+bun test test/concurrency/phase5-pending-workers.test.ts --timeout 30000
+bun run test:concurrency
+```
+
+Integração valida agendamento atômico, evento único, backoff/TTL, referência
+PENDING e PENDING_REFERENCE, incompatibilidades, rejeição, reversão duplicada,
+saldo de rollback insuficiente, falhas SQL no ledger/outbox, lease antigo e
+SKIP LOCKED quando o lease vence com a resolução ainda segurando a linha.
+UP/DOWN/UP e backfill preservam respostas e histórico financeiro.
+DOWN da Fase 5 recusa novos códigos incompatíveis com a constraint anterior e
+reverte seu próprio DDL, preservando dados; não remove auditorias para forçar
+downgrade. Use rollback de schema apenas em ambiente descartável.
+
+Concorrência da Fase 5 usa três processos reais com polling habilitado: resolução
+única, duas reversões da mesma BET, reinício durante espera, SIGKILL aguardando
+wallet e SIGKILL depois de update da wallet antes de insert do ledger. Uma pausa
+SQL exclusiva da fixture torna esse último crash determinístico. Um teste de
+fencing separado desabilita apenas o polling para controlar os claims SQL reais.
+Todos os cenários reconciliam saldo exatamente com o ledger e verificam outbox
+sem publicação. TTL/lease são envelhecidos por SQL nas fixtures para não esperar
+15 minutos/30 segundos; a produção usa os prazos completos persistidos.
+
+Consumidor SQS, inbox, DLQ funcional, publisher, autenticação e observabilidade
+completa permanecem para fases futuras. A resolução é periódica e pode aguardar
+o backoff de até 30s; não existe notificação imediata pela chegada da referência.

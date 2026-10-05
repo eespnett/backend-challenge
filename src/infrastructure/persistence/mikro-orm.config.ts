@@ -6,11 +6,12 @@ import { WalletEntity } from './entities/wallet.entity';
 import { WagerTransactionEntity } from './entities/wager-transaction.entity';
 import { WalletLedgerEntryEntity } from './entities/wallet-ledger-entry.entity';
 import { OutboxEventEntity } from './entities/outbox-event.entity';
+import { PendingReferenceJobEntity } from './entities/pending-reference-job.entity';
 
 export function createOrmConfig(config: AppConfig) {
   return defineConfig({
     ...config.database,
-    entities: [WalletEntity, WagerTransactionEntity, WalletLedgerEntryEntity, OutboxEventEntity],
+    entities: [WalletEntity, WagerTransactionEntity, WalletLedgerEntryEntity, OutboxEventEntity, PendingReferenceJobEntity],
     // Entities explicitly use wagering; migration bookkeeping stays in public.
     schema: 'public',
     extensions: [Migrator],

@@ -15,7 +15,7 @@ export interface HttpResult {
 interface Ready { type: 'ready'; pid: number; url: string; dbName: string }
 interface ApplicationProcess extends Ready { child: Subprocess<'pipe', 'pipe', 'pipe'>; drain: Promise<void>; diagnostics: () => string }
 
-export async function processHarness(instanceCount = 3) {
+export async function processHarness(instanceCount = 3, options: { pendingWorkerEnabled?: boolean } = {}) {
   if (!Number.isInteger(instanceCount) || instanceCount < 3) throw new Error('At least three real processes are required');
   const fixture = await isolatedPostgres();
   const processes: ApplicationProcess[] = [];
@@ -38,6 +38,7 @@ export async function processHarness(instanceCount = 3) {
     const child = Bun.spawn([process.execPath, resolve(root, 'test/support/application-process.ts')], {
       cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: { ...process.env, PORT: '3000', DB_HOST: db.host, DB_PORT: String(db.port), DB_NAME: db.dbName,
+        PENDING_REFERENCE_WORKER_ENABLED: String(options.pendingWorkerEnabled ?? false),
         DB_USER: db.user, DB_PASSWORD: db.password, SQS_ENDPOINT: sqs.endpoint, AWS_REGION: sqs.region,
         AWS_ACCESS_KEY_ID: sqs.accessKeyId, AWS_SECRET_ACCESS_KEY: sqs.secretAccessKey },
     });
@@ -123,6 +124,15 @@ export async function processHarness(instanceCount = 3) {
       async restart(index: number) {
         const old = processes[index]!;
         await stop(old);
+        const replacement = await start();
+        processes[index] = replacement;
+        return { oldPid: old.pid, newPid: replacement.pid };
+      },
+      async crash(index: number) {
+        const old = processes[index]!;
+        old.child.kill('SIGKILL');
+        await old.child.exited;
+        await old.drain;
         const replacement = await start();
         processes[index] = replacement;
         return { oldPid: old.pid, newPid: replacement.pid };

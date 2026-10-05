@@ -20,6 +20,7 @@ function port(env: Environment, key: string, fallback: string): number {
 
 @Injectable()
 export class AppConfig {
+  readonly pendingReferenceWorkerEnabled: boolean;
   readonly port: number;
   readonly database: Readonly<{
     host: string; port: number; dbName: string; user: string; password: string;
@@ -30,6 +31,9 @@ export class AppConfig {
 
   constructor() {
     const env = process.env;
+    const pendingWorker = env.PENDING_REFERENCE_WORKER_ENABLED ?? 'true';
+    if (!['true', 'false'].includes(pendingWorker)) throw new Error('Invalid configuration: PENDING_REFERENCE_WORKER_ENABLED');
+    this.pendingReferenceWorkerEnabled = pendingWorker === 'true';
     this.port = port(env, 'PORT', '3000');
     this.database = Object.freeze({
       host: text(env, 'DB_HOST', '127.0.0.1'),

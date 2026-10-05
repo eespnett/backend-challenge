@@ -62,6 +62,9 @@ export class ProcessWagerTransactionUseCase {
           status: transaction.status, balance: wallet.balance.toJSON(), idempotentReplay: false,
           ...(transaction.failureCode === undefined ? {} : { failureCode: transaction.failureCode }) } };
         await repositories.transactions.add(transaction, result);
+        if (decision.outcome === 'PENDING_REFERENCE') {
+          await repositories.pendingReferences.schedule(transaction.id, wallet.id, correlationId, causationId ?? transaction.id);
+        }
         if (entry !== undefined) await repositories.ledger.append(entry);
         await repositories.outbox.enqueue(transaction.id, events);
         return result;

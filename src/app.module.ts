@@ -5,8 +5,9 @@ import { SqsModule } from './infrastructure/sqs/sqs.module';
 import { HealthModule } from './health/health.module';
 import { WalletsModule } from './wallets/wallets.module';
 import { WageringModule } from './wagering/wagering.module';
+import { PendingReferencesModule } from './infrastructure/pending-references/pending-references.module';
 
 @Module({
-  imports: [ConfigModule, PersistenceModule, SqsModule, HealthModule, WalletsModule, WageringModule],
+  imports: [ConfigModule, PersistenceModule, SqsModule, HealthModule, WalletsModule, WageringModule, PendingReferencesModule],
 })
 export class AppModule {}
