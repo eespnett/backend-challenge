@@ -4,6 +4,7 @@ import { Wallet } from '../domain/wallet';
 import { WagerTransaction } from '../domain/wager-transaction';
 import { WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import { TransactionManager } from './financial-unit-of-work';
+import { WalletBalanceChanged, WagerTransactionProcessed } from '../domain/events';
 
 export interface OpenWalletInput { readonly playerId: string; readonly initialBalance: MoneyProps }
 
@@ -27,6 +28,9 @@ export class OpenWallet {
         const entry = WalletLedgerEntry.create({ ...wallet.openingMovement, id: randomUUID(),
           transactionId: opening.id, createdAt: at });
         await repositories.ledger.append(entry);
+        const context = () => ({ eventId: randomUUID(), correlationId: wallet.id, causationId: opening.id, occurredAt: at });
+        await repositories.outbox.enqueue(opening.id, [WagerTransactionProcessed.from(opening, wallet.balance, context()),
+          WalletBalanceChanged.from(wallet, entry, context())]);
       }
       return wallet;
     });

@@ -1,17 +1,23 @@
 import { Wallet } from '../domain/wallet';
 import { WagerTransaction } from '../domain/wager-transaction';
 import { WalletLedgerEntry } from '../domain/wallet-ledger-entry';
+import type { IntegrationEvent } from '../domain/events';
+import type { RecordedSubmission, StoredProcessingResult } from './processing-result';
 
 export interface WalletRepository {
   add(wallet: Wallet): Promise<void>;
   findById(id: string): Promise<Wallet | undefined>;
   findByPlayerAndCurrency(playerId: string, currency: string): Promise<Wallet | undefined>;
+  lockById(id: string): Promise<Wallet | undefined>;
+  saveLocked(wallet: Wallet): Promise<void>;
 }
 export interface WagerTransactionRepository {
-  add(transaction: WagerTransaction): Promise<void>;
+  add(transaction: WagerTransaction, result?: StoredProcessingResult): Promise<void>;
   findById(id: string): Promise<WagerTransaction | undefined>;
   findByIdempotencyKey(key: string): Promise<WagerTransaction | undefined>;
   findByProviderAndExternalId(providerId: string, externalId: string): Promise<WagerTransaction | undefined>;
+  findSubmissionByIdempotencyKey(key: string): Promise<RecordedSubmission | undefined>;
+  findProcessedReversals(referenceId: string): Promise<readonly WagerTransaction[]>;
 }
 export interface LedgerRepository {
   append(entry: WalletLedgerEntry): Promise<void>;
@@ -22,6 +28,7 @@ export interface FinancialUnitOfWork {
   readonly wallets: WalletRepository;
   readonly transactions: WagerTransactionRepository;
   readonly ledger: LedgerRepository;
+  readonly outbox: { enqueue(transactionId: string, events: readonly IntegrationEvent<unknown>[]): Promise<void> };
 }
 export interface TransactionManager {
   run<T>(work: (repositories: FinancialUnitOfWork) => Promise<T>): Promise<T>;

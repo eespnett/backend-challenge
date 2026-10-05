@@ -4,8 +4,9 @@ import { PersistenceModule } from './infrastructure/persistence/persistence.modu
 import { SqsModule } from './infrastructure/sqs/sqs.module';
 import { HealthModule } from './health/health.module';
 import { WalletsModule } from './wallets/wallets.module';
+import { WageringModule } from './wagering/wagering.module';
 
 @Module({
-  imports: [ConfigModule, PersistenceModule, SqsModule, HealthModule, WalletsModule],
+  imports: [ConfigModule, PersistenceModule, SqsModule, HealthModule, WalletsModule, WageringModule],
 })
 export class AppModule {}

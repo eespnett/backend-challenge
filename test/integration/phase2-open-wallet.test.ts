@@ -173,7 +173,7 @@ describe('constraints through direct SQL', () => {
     await expectSqlFailure(() => rawTransaction(wallet, { id: tx.id }), '23505', 'wager_transactions_pkey');
     await expectSqlFailure(() => rawTransaction(wallet, { idempotency_key: tx.idempotency_key }), '23505', 'transactions_idempotency_unique');
     await expectSqlFailure(() => rawTransaction(wallet, { external_transaction_id: tx.external_transaction_id }), '23505', 'transactions_provider_external_unique');
-    await expectSqlFailure(() => rawTransaction(wallet, { wallet_id: crypto.randomUUID() }), '23503', 'transactions_wallet_fk');
+    await expectSqlFailure(() => rawTransaction(wallet, { wallet_id: crypto.randomUUID() }), '23503', 'transactions_wallet_exists_fk');
     await expectSqlFailure(() => rawTransaction(wallet, { player_id: 'wrong-player' }), '23503', 'transactions_wallet_fk');
     await expectSqlFailure(() => rawTransaction(wallet, { currency: 'USD' }), '23503', 'transactions_wallet_fk');
   });

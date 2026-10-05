@@ -2,6 +2,7 @@ import { Entity, PrimaryKey, Property, Unique } from '@mikro-orm/core';
 import { FailureCode } from '../../../domain/failure-code';
 import { WagerTransactionKind, WagerTransactionStatus } from '../../../domain/wager-transaction';
 import { ExactMoneyType } from '../exact-money.type';
+import type { ProcessingBody, StoredProcessingResult } from '../../../application/processing-result';
 
 @Entity({ schema: 'wagering', tableName: 'wager_transactions' })
 @Unique({ name: 'transactions_idempotency_unique', properties: ['idempotencyKey'] })
@@ -25,4 +26,6 @@ export class WagerTransactionEntity {
   @Property({ type: 'text', nullable: true }) failureCode!: FailureCode | null;
   @Property({ type: Date, columnType: 'timestamptz' }) createdAt!: Date;
   @Property({ type: Date, columnType: 'timestamptz', nullable: true }) processedAt!: Date | null;
+  @Property({ type: 'smallint', nullable: true }) resultHttpStatus: StoredProcessingResult['httpStatus'] | null = null;
+  @Property({ type: 'json', columnType: 'jsonb', nullable: true }) resultBody: ProcessingBody | null = null;
 }

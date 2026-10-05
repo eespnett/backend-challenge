@@ -5,11 +5,12 @@ import { AppConfig } from '../../config/app-config';
 import { WalletEntity } from './entities/wallet.entity';
 import { WagerTransactionEntity } from './entities/wager-transaction.entity';
 import { WalletLedgerEntryEntity } from './entities/wallet-ledger-entry.entity';
+import { OutboxEventEntity } from './entities/outbox-event.entity';
 
 export function createOrmConfig(config: AppConfig) {
   return defineConfig({
     ...config.database,
-    entities: [WalletEntity, WagerTransactionEntity, WalletLedgerEntryEntity],
+    entities: [WalletEntity, WagerTransactionEntity, WalletLedgerEntryEntity, OutboxEventEntity],
     // Entities explicitly use wagering; migration bookkeeping stays in public.
     schema: 'public',
     extensions: [Migrator],

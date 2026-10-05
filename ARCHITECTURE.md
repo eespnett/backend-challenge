@@ -1,4 +1,4 @@
-# Arquitetura — Fases 0, 1 e 2
+# Arquitetura — Fases 0, 1, 2 e 3
 
 ## Escopo implementado
 
@@ -6,10 +6,13 @@ Bootstrap NestJS executado por Bun 1.4.2, TypeScript strict, PostgreSQL 17,
 MikroORM 6.5.8, SQS no LocalStack Community 4.0.3 e Docker Compose.
 O domínio financeiro puro está em src/domain, sem imports de NestJS, ORM ou
 infraestrutura. A Fase 2 persiste wallets e abertura auditável via POST /wallets.
-Ainda não há processamento geral de apostas, autenticação ou workers de negócio.
+A Fase 3 processa operações via POST /wagering/transactions com lock por wallet,
+idempotência persistente, resposta original e outbox na mesma transação SQL.
+Ainda não há autenticação, consumidor, inbox, publisher ou workers de negócio.
 
 A migration 20261005000000 cria o schema wagering; 20261005020000 cria as três
-tabelas financeiras, constraints, índices e proteção do ledger. O histórico de migrations
+tabelas financeiras, constraints, índices e proteção do ledger. A migration
+20261005030000 acrescenta resultados originais e outbox. O histórico de migrations
 fica em public; migrations executam em transação. O rollback não usa CASCADE. O search_path da conexão fica em public para
 impedir que o schema homônimo do usuário receba o histórico.
 O serviço migrate executa uma vez antes da aplicação no Compose.
@@ -53,7 +56,8 @@ verifica UP/DOWN/UP e UP repetido, e remove somente esse banco ao finalizar.
 Ele exige permissão CREATEDB (disponível no usuário local do Compose).
 DOWN da migration financeira remove suas três tabelas, índices, trigger e função,
 preservando o schema. DOWN da migration anterior remove o schema wagering.
-Após os dois rollbacks, o histórico fica vazio; a tabela de controle em public
+Antes desses dois rollbacks, DOWN da Fase 3 remove outbox e campos de resultado.
+Após os três rollbacks, o histórico fica vazio; a tabela de controle em public
 permanece por desenho do MikroORM. O teste exercita rollback com dados reais.
 
 Bun deve estar no PATH global; não existe instalação local de runtime em .tools.
@@ -323,3 +327,135 @@ da unidade transacional da aplicação; SQL administrativo ainda pode inserir da
 isolados que respeitem checks locais. Kind/status/valor da referência e a direção
 exata de ROLLBACK são validados pela política de domínio, a ser conectada na fase
 de processamento. Não foram adicionados triggers de consistência global.
+
+## Processamento, lock e idempotência — Fase 3
+
+### Contrato e reutilização
+
+ProcessWagerTransactionUseCase depende somente das portas da aplicação e domínio.
+O adaptador HTTP em src/wagering chama execute(payload, idempotencyKey, context).
+Não há chamadas a SQS, fetch ou publisher no caso de uso ou nos repositórios.
+Um futuro adaptador SQS poderá usar o mesmo caso de uso sem depender do controller.
+
+POST /wagering/transactions exige Idempotency-Key único, ASCII visível, sem vírgula,
+até 200 bytes. Identificadores textuais também são limitados a 200 bytes, sem
+espaços nas extremidades ou caracteres de controle. walletId é UUID normalizado
+para minúsculas. Campos desconhecidos são recusados; money.amount exige string
+decimal não negativa com exatamente duas casas (até 1000 caracteres).
+OPENING e provider internal não são aceitos externamente. REFUND/ROLLBACK exigem
+referenceExternalTransactionId. WIN admite a referência opcional a BET já
+prevista na política de domínio. X-Correlation-Id é opcional.
+
+```json
+{
+  "providerId": "provider-a",
+  "externalTransactionId": "tx-123",
+  "playerId": "player-1",
+  "walletId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+  "roundId": "round-1",
+  "gameId": "game-1",
+  "kind": "BET",
+  "money": { "amount": "25.00", "currency": "BRL" }
+}
+```
+
+Resposta: {transactionId,status,balance:{amount,currency},failureCode?,idempotentReplay}.
+HTTP 200 para PROCESSED; 202 para PENDING_REFERENCE; 422 para REJECTED.
+400 indica payload/header inválido ou wallet inexistente, sem registros parciais.
+409 distingue IDEMPOTENCY_CONFLICT e EXTERNAL_TRANSACTION_CONFLICT.
+503/INFRASTRUCTURE_UNAVAILABLE indica falha transitória, incluindo lock timeout,
+deadlock, serialização, indisponibilidade de conexão ou esgotamento do pool.
+Erros inesperados recebem 500 sem exposição de SQL pelo controller.
+Resposta de sucesso/rejeição só sai depois de commit concluído.
+
+### Hash canônico e resultado original
+
+SHA-256 é calculado sobre UTF-8 deste JSON compacto, em ordem fixa alfabética;
+money também tem chaves fixas. Referência ausente vira null. Nenhum timestamp,
+id interno gerado, Idempotency-Key ou metadado de transporte participa do hash.
+
+```json
+{"externalTransactionId":"tx-123","gameId":"game-1","kind":"BET","money":{"amount":"25.00","currency":"BRL"},"playerId":"player-1","providerId":"provider-a","referenceExternalTransactionId":null,"roundId":"round-1","walletId":"aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}
+```
+
+result_http_status SMALLINT e result_body JSONB preservam o status lógico e o
+corpo completo, incluindo saldo observado, moeda e failureCode. Mesmo key/hash
+retorna esse snapshot com apenas idempotentReplay=true, sem consultar a wallet,
+reavaliar a política ou gerar ledger/eventos. O saldo de replay não acompanha
+movimentos posteriores. O snapshot de PENDING_REFERENCE continuará sendo 202
+mesmo se uma fase futura resolver a referência e mudar o estado atual.
+Um trigger simples bloqueia alteração/remoção dos campos de resultado já definidos.
+CHECK valida formato, status lógico, transactionId, dinheiro como string e flag false.
+Os campos são nulos em OPENING/histórico anterior; não se inventa resposta retroativa.
+
+### Lock, conflitos e atomicidade
+
+Cada execução usa fork isolado do MikroORM e transação READ COMMITTED. Após
+precheck de key/identidade externa, findOne com PESSIMISTIC_WRITE em wallets
+executa SELECT FOR UPDATE. O lock permanece até commit/rollback. O repositório
+recusa saveLocked sem aquisição prévia do lock naquela unidade de trabalho.
+O precheck é repetido após adquirir o lock para ver o commit do detentor anterior.
+Wallets distintas não compartilham um lock global. lock_timeout=5s e
+statement_timeout=15s limitam espera; o cliente pode repetir a mesma key após 503.
+
+UNIQUE(idempotency_key) e UNIQUE(provider_id,external_transaction_id) permanecem
+a fonte da verdade. Colisões reais entre wallets distintas abortam a transação
+perdedora, incluindo seu update de saldo; somente depois do rollback uma nova
+unidade de trabalho lê o vencedor e retorna replay ou o conflito 409 apropriado.
+Não se continua usando uma transação PostgreSQL já abortada nem se faz retry
+automático de efeitos financeiros. A key tem precedência na classificação de conflito.
+
+Sob o lock, a política verifica referência por provider/id externo, player, wallet,
+moeda, rodada, kind, status e valor completo de reversão. Reversões PROCESSED
+são consultadas sob o mesmo lock; a UNIQUE parcial referenceTransactionId/kind
+é uma proteção adicional. Reversão duplicada do mesmo tipo é REJECTED.
+Referência ausente ou ainda pendente persiste PENDING_REFERENCE, sem movimento.
+Provider diferente não resolve a referência e permanece pendente.
+Nenhum worker de resolução foi adicionado.
+
+Saldo/version, transação/resultado, ledger e outbox usam o mesmo EntityManager
+e commit. LOSS, valor zero, rejeições e referências pendentes não mudam version
+nem criam ledger. Rejeições por player/moeda incompatível são auditadas: FK
+wallet_id exige wallet existente; FK composta usa colunas geradas nulas somente
+em REJECTED, mantendo a correspondência obrigatória nos demais estados.
+O ledger permanece sujeito às constraints e ao trigger imutável da Fase 2.
+
+### Outbox persistida
+
+outbox_events armazena UUID do evento, transaction_id com FK, aggregate_id,
+event_type, version, envelope JSONB, occurred_at, created_at e published_at nulo.
+CHECK valida identidade do envelope; UNIQUE(transaction_id,event_type) evita
+repetição de um tipo por transação. Índice parcial cobre eventos não publicados.
+Eventos: WagerTransactionProcessed, WagerTransactionRejected,
+WagerTransactionPendingReference e WalletBalanceChanged somente quando saldo muda.
+Abertura positiva também persiste Processed + WalletBalanceChanged no mesmo
+commit de wallet/OPENING/ledger; abertura zero não cria eventos.
+Não há publisher, timer ou operação de publicação no repositório.
+Dados anteriores à Fase 3 não recebem backfill de eventos.
+
+### Validação e limites desta fase
+
+```sh
+bun run typecheck
+bun test test/unit
+bun run test:integration
+bun test test/integration/phase3-concurrency.test.ts --timeout 30000
+```
+
+Integração usa bancos descartáveis no PostgreSQL real do Compose e o módulo HTTP
+de produção. Inclui operações, replay preservando saldo original, conflitos,
+referências, falhas SQL entre update/ledger e no insert de outbox, invisibilidade
+antes de commit e proteção do snapshot. Concorrência usa conexões/transações
+independentes: duas BET de 80 sobre 100, dez submissions idênticas, reversões,
+colisões entre wallets e prova de backend aguardando lock no pg_stat_activity.
+O rendezvous dos testes apenas sincroniza transações reais; não substitui banco,
+locks ou persistência por mocks. UP/DOWN/UP é exercitado com OPENING, BET,
+ledger, resultado e outbox; migrations anteriores não foram reescritas.
+
+DOWN da Fase 3 restaura a FK composta antiga e apaga outbox/resultados. Se houver
+rejeições com player/moeda divergentes, essa restauração falha e todo o DOWN
+faz rollback, preservando os dados; não se apagam auditorias para forçar downgrade.
+Use DOWN apenas em banco descartável e valide compatibilidade dos dados.
+Consumidor SQS, inbox, publisher, worker de referências, autenticação e
+observabilidade completa continuam para fases futuras. Eventos aguardam publicação
+e referências pendentes aguardam processamento; não há alegação de entrega externa.
