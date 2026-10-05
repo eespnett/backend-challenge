@@ -1,4 +1,4 @@
-# Arquitetura — Fases 0, 1, 2 e 3
+# Arquitetura — Fases 0, 1, 2, 3 e 4
 
 ## Escopo implementado
 
@@ -8,6 +8,8 @@ O domínio financeiro puro está em src/domain, sem imports de NestJS, ORM ou
 infraestrutura. A Fase 2 persiste wallets e abertura auditável via POST /wallets.
 A Fase 3 processa operações via POST /wagering/transactions com lock por wallet,
 idempotência persistente, resposta original e outbox na mesma transação SQL.
+A Fase 4 testa concorrência HTTP com três processos Bun independentes, restart,
+stress controlado e locks observados diretamente no PostgreSQL.
 Ainda não há autenticação, consumidor, inbox, publisher ou workers de negócio.
 
 A migration 20261005000000 cria o schema wagering; 20261005020000 cria as três
@@ -31,6 +33,7 @@ docker compose up -d --wait postgres localstack
 bun run migration:up
 bun run check:infra
 bun run test:integration
+bun run test:concurrency
 docker compose up -d --build --wait app
 ```
 
@@ -459,3 +462,87 @@ Use DOWN apenas em banco descartável e valide compatibilidade dos dados.
 Consumidor SQS, inbox, publisher, worker de referências, autenticação e
 observabilidade completa continuam para fases futuras. Eventos aguardam publicação
 e referências pendentes aguardam processamento; não há alegação de entrega externa.
+
+## Concorrência real — Fase 4
+
+### Processos e distribuição
+
+test/support/process-harness.ts cria um banco PostgreSQL vazio descartável,
+aplica as migrations existentes e inicia três processos usando o executável Bun
+global atual (process.execPath). Cada filho carrega o AppModule de produção pelo
+entry point test/support/application-process.ts, sem overrides de repositórios,
+use cases, locks ou pools. O entry point muda somente o bootstrap de teste:
+logger desativado, bind em loopback e porta 0 atribuída pelo sistema operacional.
+Um envelope stdout confirma PID, URL e nome do banco; o parent verifica readiness.
+Portas e PIDs precisam ser distintos, e todos os filhos usam o mesmo banco.
+Cada instância mantém seu próprio pool MikroORM de até dez conexões.
+
+parallelRequests libera chamadas HTTP de uma barreira comum; instância i % 3
+distribui requisições em rodízio. boundedRequests limita o stress a 30 chamadas
+em voo. Os helpers drenam todas as chamadas antes de retornar falhas. Nenhuma
+dessas estruturas decide idempotência ou efeitos financeiros: isso permanece
+exclusivamente no PostgreSQL e na unidade transacional da aplicação.
+
+restart encerra o filho pelo stdin, aguarda app.close/saída e inicia outro PID
+com os mesmos parâmetros de banco. O teardown encerra todos os filhos, drena
+stdout/stderr e remove somente o banco aleatório pertencente à fixture.
+Timeouts de bootstrap, HTTP e shutdown são limitados; shutdown tem fallback
+para kill se o filho não encerrar. O harness também limpa filhos que iniciaram
+quando outro bootstrap falha. O processo pai não imprime credenciais.
+
+### Cenários e reconciliação
+
+```sh
+docker compose up -d --wait postgres localstack
+bun run typecheck
+bun test test/unit
+bun run test:integration
+bun run test:concurrency
+```
+
+O LocalStack é necessário apenas para o readiness existente; não foi adicionado
+consumidor nem publisher. Cada arquivo em test/concurrency usa seu próprio banco
+isolado e três processos reais. Os cenários cobrem:
+
+- cinquenta envios simultâneos com mesma key/payload: um processamento, 49 replays
+  e um único débito, além do crédito de abertura;
+- cinquenta keys com mesma identidade externa: um processamento e 49 conflitos;
+- duas BET de 80.00 sobre 100.00 em processos distintos: PROCESSED/REJECTED,
+  saldo 20.00, um débito e retries sem novo efeito;
+- replay em novo PID após outra instância movimentar o saldo: resposta original
+  de 75.00 preservada, mesmo com saldo atual 125.00;
+- stress com 360 operações únicas (BET/WIN/LOSS) em 12 wallets, mais 360 retries,
+  paralelismo limitado a 30 e saldo final 110.00 por wallet;
+- avanço em seis wallets distintas enquanto duas conexões aguardam lock de
+  outra wallet, comprovado por pg_stat_activity e pg_blocking_pids;
+- três lock timeouts reais de cinco segundos, HTTP 503, nenhum registro parcial,
+  retries bem-sucedidos após liberação e novos envios retornando replay.
+
+assert-ledger-consistency.ts executa aritmética NUMERIC exata no banco:
+wallet.balance == COALESCE(SUM(CREDIT.amount - DEBIT.amount), 0).
+Dinheiro retornado para diagnóstico permanece texto. Também verifica duplicação
+de ledger por wallet/transação, ledger associado a PROCESSED, exclusão de LOSS,
+valor/moeda correspondentes e ausência de outbox publicada. A asserção é executada
+após cada cenário; checks adicionais comparam version, ledger, transações e outbox.
+
+reportScenario imprime JSON com nome, duração em milissegundos e contagens/saldos.
+Os tempos principais incluem a execução HTTP e verificações do cenário, após
+preparo das wallets; restart inclui shutdown/bootstrap. Stress inclui os retries.
+São medidas locais de correção sob carga controlada, sem promessa de throughput,
+latência de produção ou execução em hosts distintos.
+
+### Correção necessária revelada pelo paralelismo
+
+Os cinquenta envios descobriram uma janela READ COMMITTED: SELECT por key retornava
+vazio; o vencedor fazia commit; SELECT por identidade externa encontrava a própria
+key e retornava EXTERNAL_TRANSACTION_CONFLICT indevidamente. resolveExisting agora
+reconhece essa key, relê o resultado original e aplica as mesmas regras de hash/replay.
+Uma reprodução determinística pausa apenas o primeiro SELECT real, permite que
+outro processo faça commit e retoma a leitura; cobre hash igual (replay) e diferente
+(IDEMPOTENCY_CONFLICT). A sincronização de teste não substitui SQL ou processamento.
+Essa é a única alteração funcional da Fase 4; schema, migrations, política financeira,
+locks e fronteira transacional permanecem os da Fase 3.
+
+Não foram implementados consumer SQS, inbox, publisher, worker de referências,
+autenticação ou observabilidade completa. O teste de reinício ocorre após resposta
+e commit confirmados; crash durante commit/ack de mensagens é escopo das fases futuras.

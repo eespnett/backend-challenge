@@ -13,6 +13,7 @@
     "test": "bun test test/unit test/smoke",
     "test:smoke": "bun test test/smoke",
     "test:integration": "bun test test/integration --timeout 30000",
+    "test:concurrency": "bun test test/concurrency --timeout 30000",
     "migration:up": "bun scripts/migrate.ts up",
     "migration:down": "bun scripts/migrate.ts down",
     "migration:list": "bun scripts/migrate.ts list",

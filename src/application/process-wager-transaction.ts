@@ -88,7 +88,16 @@ export class ProcessWagerTransactionUseCase {
     const record = await repositories.transactions.findSubmissionByIdempotencyKey(request.idempotencyKey);
     if (record !== undefined) return this.replay(record, hash);
     const external = await repositories.transactions.findByProviderAndExternalId(request.providerId, request.externalTransactionId);
-    if (external !== undefined) throw new ProcessingConflictError('EXTERNAL_TRANSACTION_CONFLICT');
+    if (external !== undefined) {
+      // READ COMMITTED can observe a commit between these two SELECTs. An external
+      // identity with our own key is a replay, not a collision with another key.
+      if (external.idempotencyKey === request.idempotencyKey) {
+        const committed = await repositories.transactions.findSubmissionByIdempotencyKey(request.idempotencyKey);
+        if (committed === undefined) throw new InfrastructureUnavailableError();
+        return this.replay(committed, hash);
+      }
+      throw new ProcessingConflictError('EXTERNAL_TRANSACTION_CONFLICT');
+    }
     return undefined;
   }
 }
