@@ -1,14 +1,15 @@
-# Arquitetura — Fases 0 e 1
+# Arquitetura — Fases 0, 1 e 2
 
 ## Escopo implementado
 
 Bootstrap NestJS executado por Bun 1.4.2, TypeScript strict, PostgreSQL 17,
 MikroORM 6.5.8, SQS no LocalStack Community 4.0.3 e Docker Compose.
 O domínio financeiro puro está em src/domain, sem imports de NestJS, ORM ou
-infraestrutura. Ainda não há operações financeiras persistidas, controllers
-financeiros, autenticação nem workers de negócio.
+infraestrutura. A Fase 2 persiste wallets e abertura auditável via POST /wallets.
+Ainda não há processamento geral de apostas, autenticação ou workers de negócio.
 
-A migration inicial cria somente o schema wagering. O histórico de migrations
+A migration 20261005000000 cria o schema wagering; 20261005020000 cria as três
+tabelas financeiras, constraints, índices e proteção do ledger. O histórico de migrations
 fica em public; migrations executam em transação. O rollback não usa CASCADE. O search_path da conexão fica em public para
 impedir que o schema homônimo do usuário receba o histórico.
 O serviço migrate executa uma vez antes da aplicação no Compose.
@@ -27,7 +28,7 @@ docker compose up -d --wait postgres localstack
 bun run migration:up
 bun run check:infra
 bun run test:integration
-docker compose up -d --build app
+docker compose up -d --build --wait app
 ```
 
 Health: GET /health/live e GET /health/ready, sem autenticação.
@@ -50,9 +51,10 @@ com filas locais sem consumidores nem mensagens de negócio.
 O teste migration-lifecycle cria um banco vazio isolado com nome aleatório,
 verifica UP/DOWN/UP e UP repetido, e remove somente esse banco ao finalizar.
 Ele exige permissão CREATEDB (disponível no usuário local do Compose).
-Após DOWN, o schema wagering desaparece e o histórico fica vazio; a tabela de
-controle public.mikro_orm_migrations permanece por desenho do MikroORM.
-Nenhuma tabela da aplicação é criada nesta fase.
+DOWN da migration financeira remove suas três tabelas, índices, trigger e função,
+preservando o schema. DOWN da migration anterior remove o schema wagering.
+Após os dois rollbacks, o histórico fica vazio; a tabela de controle em public
+permanece por desenho do MikroORM. O teste exercita rollback com dados reais.
 
 Bun deve estar no PATH global; não existe instalação local de runtime em .tools.
 
@@ -84,16 +86,16 @@ Logs e métricas completos pertencem à fase de observabilidade.
 
 Priorizar PKs, FKs, UNIQUEs, CHECKs, índices e transações. Não implementar
 constraint triggers diferidos complexos nem proteção especial de TRUNCATE.
-Um trigger simples de bloqueio UPDATE/DELETE do ledger poderá ser adicionado
-sem comprometer prazo e estabilidade.
+Um trigger simples de bloqueio UPDATE/DELETE do ledger foi adicionado na Fase 2.
 
 Money usa bigint em centavos no domínio, com parsing/serialização por strings.
 Nenhuma quantia monetária passará por number. Contratos HTTP/SQS terão duas
 casas decimais e a persistência será exata. Money foi implementado na Fase 1.
 
-Idempotência terá UNIQUE(idempotency_key),
-UNIQUE(provider_id, external_transaction_id), payloadHash e resultado original
-persistido. O replay de PENDING será mantido simples, com a decisão contratual
+Idempotência já tem UNIQUE(idempotency_key),
+UNIQUE(provider_id, external_transaction_id) e payloadHash. Replay e resultado
+original persistido pertencem à fase de processamento. O replay de PENDING será
+mantido simples, com a decisão contratual
 documentada quando esse fluxo for implementado.
 
 Autenticação não vale pontos e será omitida, com porta de identidade explícita
@@ -102,8 +104,8 @@ Implementação avança somente mediante aprovação, uma fase por vez.
 
 ## Domínio financeiro — Fase 1
 
-O domínio não é importado pelo AppModule nesta fase. Não houve alteração de
-schema, migrations, dependências, controllers, SQS ou persistência.
+Na Fase 1 o domínio foi implementado isoladamente. A Fase 2 o conecta à aplicação
+por mappers e factories, mantendo src/domain sem dependências externas.
 
 ### Money
 
@@ -121,7 +123,7 @@ Objetos Money são congelados; serialização sempre devolve strings decimais.
 
 Wallet.open mantém saldo inicial e version=1. openingMovement descreve o crédito
 de zero ao saldo inicial quando positivo, sem incrementar a versão; a aplicação
-futura deverá associá-lo à transação interna OPENING e ao ledger na mesma SQL.
+o associa à transação interna OPENING e ao ledger na mesma SQL na Fase 2.
 rehydrate restaura saldo, versão e datas sem gerar novo movimento de abertura.
 debit/credit retornam um WalletBalanceChange congelado com walletId, direção,
 money, balanceBefore, balanceAfter e walletVersion. A aplicação poderá criar
@@ -133,9 +135,9 @@ inteiro seguro apenas como metadado, nunca como dinheiro.
 WalletLedgerEntry.create e rehydrate validam moedas, saldos não negativos,
 valor positivo e aritmética exata. São imutáveis, sem transições. Datas recebidas
 e devolvidas pelas entidades são copiadas defensivamente.
-Unicidade player+currency, um ledger por transação/wallet, atomicidade e controle
-de concorrência dependem da persistência das próximas fases; o domínio não
-simula essas garantias com memória nem executa SQL.
+Unicidade player+currency e um ledger por transação/wallet são garantidos no
+banco na Fase 2, com atomicidade da abertura. Controle de concorrência entre
+apostas pertence à fase de processamento; o domínio não executa SQL.
 
 ### Transações e política
 
@@ -176,7 +178,8 @@ inválidos. Expiração de espera e backoff não são implementados nesta fase.
 processedReversals recebe fatos carregados pela aplicação; uma reversão já
 PROCESSED da mesma referência e mesmo kind causa DUPLICATE_REVERSAL.
 REFUND e ROLLBACK são tipos distintos, conforme regra explícita do README.
-Não há garantia de unicidade concorrente sem a futura constraint/transação SQL.
+A Fase 2 inclui índice único parcial por referência/kind PROCESSED; aplicação
+geral das reversões e controle de concorrência pertencem à fase de processamento.
 
 ### Códigos estáveis
 
@@ -218,3 +221,105 @@ bun test test/unit/domain
 Os testes são puros, sem NestJS, ORM, PostgreSQL ou SQS. Cobrem precisão grande,
 parsing, moedas, imutabilidade, factories, movimentos/ledger, referências,
 reversões, ausência de saldo e estados terminais.
+
+## Schema e abertura auditável — Fase 2
+
+### Persistência exata e entidades
+
+WalletEntity, WagerTransactionEntity e WalletLedgerEntryEntity são classes de
+persistência separadas, no schema wagering. Money não recebe decorators nem
+tipos de ORM. Mappers reconstroem domínio exclusivamente por rehydrate.
+IDs internos são UUID; player/provider/round/game e ids externos são texto.
+
+Dinheiro usa NUMERIC sem precisão/escala fixa: NUMERIC(p,2) arredondaria entradas
+SQL com mais casas antes do CHECK. Os CHECKs exigem valores finitos, não negativos
+e scale <= 2; ledger exige amount > 0. Leituras SQL com escala 0/1 são normalizadas
+para duas casas por strings e bigint. ExactMoneyType mantém valor, hidratação e
+comparação como strings, sem DecimalType (que compara convertendo para number).
+O limite de magnitude é o limite nativo de NUMERIC do PostgreSQL, sem arredondamento.
+version é BIGINT com intervalo 1..9007199254740991 e conversão para number apenas
+como metadado inteiro seguro; o ORM não incrementa versão automaticamente.
+
+### Constraints e índices
+
+| Objeto | Garantia |
+|---|---|
+| wallets | PK id; UNIQUE(player_id,currency); moeda válida; balance >= 0; versão inteira segura >= 1 |
+| wager_transactions | PK id; UNIQUE idempotency_key e provider/external; kinds/status/codes válidos; valor exato não negativo |
+| wallet_ledger_entries | PK id; UNIQUE(wallet_id,transaction_id); direção válida; valor positivo; saldos não negativos; before +/- amount = after |
+| FK transação/wallet | walletId, playerId e moeda correspondem à mesma wallet |
+| FK referência | id interno, id externo, provider, player, wallet, moeda e rodada correspondem à mesma referência |
+| FK ledger/transação | wallet, moeda, valor, kind e status correspondem à mesma transação |
+| Checks ledger | só PROCESSED; exclui LOSS; BET exige DEBIT, OPENING/WIN/REFUND exigem CREDIT; ROLLBACK admite inversão |
+| Índice único parcial de reversões | uma reversão PROCESSED por referenceTransactionId + kind |
+
+Transações PROCESSED têm processed_at; demais estados não. REJECTED/FAILED têm
+failure_code conhecido; demais estados não. REFUND/ROLLBACK exigem referência
+externa. Referência interna só aparece em PROCESSED, é diferente do próprio id
+e resolve a referência externa. OPENING reserva provider internal, id externo
+igual ao id interno, idempotency key por wallet, rodada/game internos e amount > 0.
+Não há ON DELETE CASCADE. UNIQUEs adicionais suportam as FKs compostas.
+
+Índices (wallet_id,created_at,id) suportam histórico estável de transações/ledger.
+Há índices para ledger por transaction_id, referência interna e referências
+pendentes por provider/id externo/data. A UNIQUE provider/external serve à
+resolução da referência externa. DDL manual das migrations é autoritativo;
+schema.update/schema.create automáticos não substituem constraints e triggers.
+
+### Ledger imutável
+
+Um único trigger BEFORE UPDATE OR DELETE, por linha, sempre lança SQLSTATE 55000,
+inclusive em update sem mudança. Repositório de ledger só expõe append e leitura.
+O trigger também protege SQL direto. Não existe constraint trigger diferido,
+proteção especial de TRUNCATE ou promessa contra administradores que desabilitem
+triggers. O rollback de migration remove tabelas na ordem de dependência, sem
+CASCADE; é destrutivo e deve ser usado somente no ambiente descartável.
+
+### Unidade de trabalho e abertura
+
+FinancialUnitOfWork e TransactionManager são portas da aplicação. O adaptador
+MikroOrmTransactionManager cria EntityManager fork isolado por chamada e usa
+transactional(). Repositórios são construídos com esse mesmo manager e fazem
+flush explícito em ordem wallet -> transação -> ledger. Flush não é commit:
+qualquer erro no callback ou commit causa rollback de toda a unidade de trabalho.
+Nenhuma entidade de persistência vaza pelas portas para o domínio.
+
+OpenWallet valida Money antes de abrir a transação. Saldo zero grava só wallet.
+Saldo positivo grava wallet com version=1, OPENING PROCESSED e ledger CREDIT
+de 0.00 ao saldo inicial na mesma transação. A OPENING usa SHA-256 de JSON com
+chaves fixas em ordem alfabética: currency, initialBalance, playerId, walletId.
+Não há publicação de eventos ou registros inbox/outbox nesta fase.
+
+A UNIQUE de player/currency é a fonte da verdade para duplicação; não se usa
+precheck suscetível a corrida. Apenas a violação dessa constraint é convertida
+em WalletAlreadyExistsError. Demais erros de banco propagam e fazem rollback.
+
+POST /wallets recebe {playerId,initialBalance:{amount,currency}} e retorna
+{id,playerId,balance:{amount,currency},version}. HTTP 201 só após commit;
+409/WALLET_ALREADY_EXISTS para duplicação; 400 para corpo inválido ou erro de
+Money/domínio. Erros inesperados recebem o tratamento 500 padrão do Nest,
+sem retornar detalhes SQL. Autenticação permanece omitida conforme decisão aprovada.
+
+### Verificação e limites
+
+```sh
+bun run typecheck
+bun test test/unit
+bun run test:integration
+```
+
+phase2-open-wallet usa um banco vazio isolado no PostgreSQL real do Compose e o
+módulo HTTP de produção. Testa abertura zero/positiva, precisão muito acima do
+limite seguro de number, conflito, HTTP e rollback após falha no INSERT do ledger.
+Uma função/trigger exclusiva do teste provoca essa falha depois dos flushes de
+wallet/OPENING; contagens independentes comprovam ausência de registros parciais.
+SQL direto exercita PKs, UNIQUEs, FKs, CHECKs, aritmética e UPDATE/DELETE bloqueados.
+migration-lifecycle testa dois ciclos completos com dados e reaplicação idempotente.
+Fixtures removem apenas seus bancos de nome aleatório; exigem CREATEDB.
+
+Não há use case de BET/WIN/LOSS/REFUND/ROLLBACK, consumidor SQS, publisher outbox
+ou locking entre apostas. A coerência global de saldo com soma do ledger depende
+da unidade transacional da aplicação; SQL administrativo ainda pode inserir dados
+isolados que respeitem checks locais. Kind/status/valor da referência e a direção
+exata de ROLLBACK são validados pela política de domínio, a ser conectada na fase
+de processamento. Não foram adicionados triggers de consistência global.

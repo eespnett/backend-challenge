@@ -1,22 +1,13 @@
 import 'reflect-metadata';
 import { expect, test } from 'bun:test';
-import { MikroORM } from '@mikro-orm/postgresql';
-import { AppConfig } from '../../src/config/app-config';
-import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
+import { isolatedPostgres } from '../support/isolated-postgres';
+import { OpenWallet } from '../../src/application/open-wallet';
+import { MikroOrmTransactionManager } from '../../src/infrastructure/persistence/mikro-orm-transaction-manager';
 
 test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () => {
-  const config = new AppConfig();
-  const admin = await MikroORM.init(createOrmConfig(config));
-  // Generated identifier only: never reset or drop the application's database.
-  const dbName = `phase0_probe_${crypto.randomUUID().replaceAll('-', '')}`;
-  let created = false;
-  let probe: MikroORM | undefined;
+  const fixture = await isolatedPostgres();
+  const probe = fixture.orm;
   try {
-    await admin.em.getConnection().execute(`create database "${dbName}" template template0`);
-    created = true;
-    probe = await MikroORM.init(createOrmConfig({
-      ...config, database: { ...config.database, dbName },
-    }));
     const connection = probe.em.getConnection();
     const state = async () => {
       const schemas: Array<{ exists: boolean }> = await connection.execute(
@@ -31,7 +22,7 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
     expect(await state()).toEqual({ wagering: false, tables: [] });
     const migrator = probe.getMigrator();
     // MikroORM keeps its bookkeeping table after DOWN; establish that baseline.
-    expect(await migrator.getPendingMigrations()).toHaveLength(1);
+    expect(await migrator.getPendingMigrations()).toHaveLength(2);
     const baseline = await state();
     expect(baseline).toEqual({
       wagering: false,
@@ -41,30 +32,43 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
       'select name from public.mikro_orm_migrations order by id',
     );
     expect(await history()).toEqual([]);
+    const migrated = { wagering: true, tables: [
+      ...baseline.tables,
+      { table_schema: 'wagering', table_name: 'wager_transactions' },
+      { table_schema: 'wagering', table_name: 'wallet_ledger_entries' },
+      { table_schema: 'wagering', table_name: 'wallets' },
+    ] };
+    const expectedHistory = [{ name: 'Migration20261005000000' }, { name: 'Migration20261005020000' }];
 
     for (let cycle = 0; cycle < 2; cycle++) {
       await migrator.up();
-      expect(await state()).toEqual({ ...baseline, wagering: true });
-      expect(await history()).toEqual([{ name: 'Migration20261005000000' }]);
+      expect(await state()).toEqual(migrated);
+      expect(await history()).toEqual(expectedHistory);
       expect(await migrator.getPendingMigrations()).toHaveLength(0);
       // A repeated UP must not add another history record.
       await migrator.up();
-      expect(await history()).toHaveLength(1);
+      expect(await history()).toHaveLength(2);
+      // DOWN must also work with actual wallet + OPENING + immutable ledger rows.
+      await new OpenWallet(new MikroOrmTransactionManager(probe)).execute({ playerId: `cycle-${cycle}`,
+        initialBalance: { amount: '10.00', currency: 'BRL' } });
+      await migrator.down();
+      expect(await state()).toEqual({ ...baseline, wagering: true });
+      expect(await history()).toEqual([{ name: 'Migration20261005000000' }]);
+      const functions: Array<{ count: string }> = await connection.execute(
+        "select count(*)::text from pg_proc p join pg_namespace n on n.oid=p.pronamespace " +
+        "where n.nspname='wagering' and p.proname='prevent_ledger_mutation'",
+      );
+      expect(functions[0]?.count).toBe('0');
       await migrator.down();
       expect(await state()).toEqual(baseline);
       expect(await history()).toEqual([]);
-      expect(await migrator.getPendingMigrations()).toHaveLength(1);
+      expect(await migrator.getPendingMigrations()).toHaveLength(2);
     }
     await migrator.up();
-    expect(await state()).toEqual({ ...baseline, wagering: true });
-    expect(await history()).toEqual([{ name: 'Migration20261005000000' }]);
+    expect(await state()).toEqual(migrated);
+    expect(await history()).toEqual(expectedHistory);
     expect(await migrator.getPendingMigrations()).toHaveLength(0);
   } finally {
-    try {
-      if (probe) await probe.close(true);
-      if (created) await admin.em.getConnection().execute(`drop database "${dbName}"`);
-    } finally {
-      await admin.close(true);
-    }
+    await fixture.dispose();
   }
 });
