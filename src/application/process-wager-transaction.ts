@@ -13,14 +13,24 @@ export class ProcessWagerTransactionUseCase {
   constructor(private readonly transactions: TransactionManager) {}
 
   async execute(body: unknown, key: unknown, context: { correlationId?: string; causationId?: string } = {}): Promise<StoredProcessingResult> {
+    return this.process(body, key, context);
+  }
+
+  /** The caller owns commit/rollback (e.g. inbox + financial effects). No nested transaction. */
+  async executeInTransaction(repositories: FinancialUnitOfWork, body: unknown, key: unknown,
+    context: { correlationId?: string; causationId?: string } = {}): Promise<StoredProcessingResult> {
+    return this.process(body, key, context, repositories);
+  }
+
+  private async process(body: unknown, key: unknown, context: { correlationId?: string; causationId?: string },
+    scoped?: FinancialUnitOfWork): Promise<StoredProcessingResult> {
     const request = validateWagerRequest(body, key);
     const hash = wagerPayloadHash(request);
     const correlationId = context.correlationId === undefined ? randomUUID() : requestText(context.correlationId, 'correlationId');
     const causationId = context.causationId === undefined ? undefined : requestText(context.causationId, 'causationId');
     // Creation validates required references before any wallet mutation.
     const transaction = WagerTransaction.create({ ...request, id: randomUUID(), payloadHash: hash, createdAt: new Date() });
-    try {
-      return await this.transactions.run(async (repositories) => {
+    const work = async (repositories: FinancialUnitOfWork) => {
         const existing = await this.resolveExisting(repositories, request, hash);
         if (existing !== undefined) return existing;
         const wallet = await repositories.wallets.lockById(request.walletId);
@@ -68,7 +78,11 @@ export class ProcessWagerTransactionUseCase {
         if (entry !== undefined) await repositories.ledger.append(entry);
         await repositories.outbox.enqueue(transaction.id, events);
         return result;
-      });
+      };
+    // A uniqueness collision must escape the caller's transaction before recovery.
+    if (scoped !== undefined) return work(scoped);
+    try {
+      return await this.transactions.run(work);
     } catch (error) {
       if (!(error instanceof SubmissionUniquenessCollision)) throw error;
       // The entire losing SQL transaction has already rolled back, including wallet update.

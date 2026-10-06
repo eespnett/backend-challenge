@@ -4,6 +4,7 @@ import { WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import type { IntegrationEvent } from '../domain/events';
 import type { RecordedSubmission, StoredProcessingResult } from './processing-result';
 import type { PendingReferenceRepository } from './pending-reference-ports';
+import type { InboxRepository } from './inbox-ports';
 
 export interface WalletRepository {
   add(wallet: Wallet): Promise<void>;
@@ -27,6 +28,7 @@ export interface LedgerRepository {
   listForWallet(walletId: string): Promise<readonly WalletLedgerEntry[]>;
 }
 export interface FinancialUnitOfWork {
+  readonly inbox: InboxRepository;
   readonly wallets: WalletRepository;
   readonly transactions: WagerTransactionRepository;
   readonly ledger: LedgerRepository;

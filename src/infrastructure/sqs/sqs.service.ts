@@ -1,4 +1,4 @@
-import { Inject, Injectable, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, OnApplicationShutdown } from '@nestjs/common';
 import { GetQueueAttributesCommand, GetQueueUrlCommand, SQSClient } from '@aws-sdk/client-sqs';
 import { AppConfig } from '../../config/app-config';
 
@@ -9,10 +9,10 @@ export const QUEUE_NAMES = [
 ] as const;
 
 @Injectable()
-export class SqsService implements OnModuleDestroy {
+export class SqsService implements OnApplicationShutdown {
   readonly client: SQSClient;
 
-  constructor(@Inject(AppConfig) config: AppConfig) {
+  constructor(@Inject(AppConfig) private readonly config: AppConfig) {
     this.client = new SQSClient({
       endpoint: config.sqs.endpoint,
       region: config.sqs.region,
@@ -37,7 +37,7 @@ export class SqsService implements OnModuleDestroy {
   }
 
   async check(): Promise<void> {
-    await Promise.all(QUEUE_NAMES.map(async (name) => {
+    await Promise.all([this.config.messaging.queueName, this.config.messaging.dlqName, 'wager-events.fifo'].map(async (name) => {
       const QueueUrl = await this.queueUrl(name);
       await this.client.send(
         new GetQueueAttributesCommand({ QueueUrl, AttributeNames: ['QueueArn'] }),
@@ -46,7 +46,8 @@ export class SqsService implements OnModuleDestroy {
     }));
   }
 
-  onModuleDestroy(): void {
+  // Workers drain in onModuleDestroy before this final application hook.
+  onApplicationShutdown(): void {
     this.client.destroy();
   }
 }

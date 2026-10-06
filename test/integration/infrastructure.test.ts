@@ -56,7 +56,7 @@ test('real LocalStack FIFO send, receive, delete and DLQ policy', async () => {
     expect(receipt).toBeDefined();
   } finally {
     if (receipt) await sqs.client.send(new DeleteMessageCommand({ QueueUrl, ReceiptHandle: receipt }));
-    sqs.onModuleDestroy();
+    sqs.onApplicationShutdown();
   }
 });
 

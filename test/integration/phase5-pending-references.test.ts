@@ -98,7 +98,7 @@ describe('durable pending references on real PostgreSQL',()=>{
       });
       const sql=fixture.orm.em.getConnection();
       for(let cycle=0;cycle<2;cycle++){
-        await fixture.orm.getMigrator().up();
+        await fixture.orm.getMigrator().up({to:'Migration20261005050000'});
         expect(await sql.execute('select transaction_id,status,attempts,correlation_id from wagering.pending_reference_jobs'))
           .toEqual([{transaction_id:tx.id,status:'READY',attempts:0,correlation_id:'legacy-correlation'}]);
         expect(await sql.execute('select result_body from wagering.wager_transactions where id=?',[tx.id])).toEqual([{result_body:result.body}]);
@@ -289,6 +289,7 @@ describe('durable pending references on real PostgreSQL',()=>{
     // REFERENCE_NOT_FOUND is an older code; use an existing unprocessable reference for the new code.
     await pendingRawBet(wagerBody(wallet,Kind.Bet,'25.00',{externalTransactionId:'missing'}));
     expect(await reprocess.execute(await claim(pending.body.transactionId))).toBe('EXPIRED');
+    await h.orm.getMigrator().down(); // Phase 6 has no inbox deliveries in this fixture.
     await expect(h.orm.getMigrator().down()).rejects.toThrow();
     expect((await jobState(pending.body.transactionId)).status).toBe('EXPIRED');
     expect((await txState(pending.body.transactionId)).failure_code).toBe('REFERENCE_NOT_PROCESSABLE');

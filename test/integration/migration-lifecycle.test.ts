@@ -24,7 +24,7 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
     expect(await state()).toEqual({ wagering: false, tables: [] });
     const migrator = probe.getMigrator();
     // MikroORM keeps its bookkeeping table after DOWN; establish that baseline.
-    expect(await migrator.getPendingMigrations()).toHaveLength(4);
+    expect(await migrator.getPendingMigrations()).toHaveLength(5);
     const baseline = await state();
     expect(baseline).toEqual({
       wagering: false,
@@ -36,6 +36,8 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
     expect(await history()).toEqual([]);
     const migrated = { wagering: true, tables: [
       ...baseline.tables,
+      { table_schema: 'wagering', table_name: 'consumer_dead_letters' },
+      { table_schema: 'wagering', table_name: 'consumer_inbox' },
       { table_schema: 'wagering', table_name: 'outbox_events' },
       { table_schema: 'wagering', table_name: 'pending_reference_jobs' },
       { table_schema: 'wagering', table_name: 'wager_transactions' },
@@ -43,7 +45,7 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
       { table_schema: 'wagering', table_name: 'wallets' },
     ] };
     const expectedHistory = [{ name: 'Migration20261005000000' }, { name: 'Migration20261005020000' },
-      { name: 'Migration20261005030000' }, { name: 'Migration20261005050000' }];
+      { name: 'Migration20261005030000' }, { name: 'Migration20261005050000' }, { name: 'Migration20261005060000' }];
 
     for (let cycle = 0; cycle < 2; cycle++) {
       await migrator.up();
@@ -52,7 +54,7 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
       expect(await migrator.getPendingMigrations()).toHaveLength(0);
       // A repeated UP must not add another history record.
       await migrator.up();
-      expect(await history()).toHaveLength(4);
+      expect(await history()).toHaveLength(5);
       // DOWN must also work with actual wallet + OPENING + immutable ledger rows.
       const manager = new MikroOrmTransactionManager(probe);
       const wallet = await new OpenWallet(manager).execute({ playerId: `cycle-${cycle}`,
@@ -60,9 +62,17 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
       const processed = await new ProcessWagerTransactionUseCase(manager).execute(wagerBody(wallet, undefined, '2.00'), crypto.randomUUID());
       expect(processed.httpStatus).toBe(200);
       expect(processed.body.balance.amount).toBe('8.00');
+      await manager.run(async (uow) => {
+        await uow.inbox.reserve(`migration-cycle-${cycle}`,'a'.repeat(64));
+        await uow.inbox.finish(`migration-cycle-${cycle}`,'a'.repeat(64),processed);
+      });
+      await migrator.down();
+      expect(await history()).toEqual(expectedHistory.slice(0, 4));
+      const phase5 = { ...migrated, tables: migrated.tables.filter((t) => !t.table_name.startsWith('consumer_')) };
+      expect(await state()).toEqual(phase5);
       await migrator.down();
       expect(await history()).toEqual(expectedHistory.slice(0, 3));
-      const phase3 = { ...migrated, tables: migrated.tables.filter((t) => t.table_name !== 'pending_reference_jobs') };
+      const phase3 = { ...phase5, tables: phase5.tables.filter((t) => t.table_name !== 'pending_reference_jobs') };
       expect(await state()).toEqual(phase3);
       await migrator.down();
       expect(await history()).toEqual(expectedHistory.slice(0, 2));
@@ -78,7 +88,7 @@ test('empty PostgreSQL database supports reproducible UP, DOWN, UP', async () =>
       await migrator.down();
       expect(await state()).toEqual(baseline);
       expect(await history()).toEqual([]);
-      expect(await migrator.getPendingMigrations()).toHaveLength(4);
+      expect(await migrator.getPendingMigrations()).toHaveLength(5);
     }
     await migrator.up();
     expect(await state()).toEqual(migrated);

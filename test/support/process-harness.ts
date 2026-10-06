@@ -15,7 +15,9 @@ export interface HttpResult {
 interface Ready { type: 'ready'; pid: number; url: string; dbName: string }
 interface ApplicationProcess extends Ready { child: Subprocess<'pipe', 'pipe', 'pipe'>; drain: Promise<void>; diagnostics: () => string }
 
-export async function processHarness(instanceCount = 3, options: { pendingWorkerEnabled?: boolean } = {}) {
+export async function processHarness(instanceCount = 3, options: { pendingWorkerEnabled?: boolean; messagingEnabled?: boolean;
+  queueName?: string; dlqName?: string; shutdownMs?: number; pauseBeforeAck?: boolean;
+  visibilitySeconds?: number; messagingInstances?: readonly number[] } = {}) {
   if (!Number.isInteger(instanceCount) || instanceCount < 3) throw new Error('At least three real processes are required');
   const fixture = await isolatedPostgres();
   const processes: ApplicationProcess[] = [];
@@ -32,13 +34,19 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     await instance.drain;
   }
 
-  async function start(): Promise<ApplicationProcess> {
+  async function start(index: number): Promise<ApplicationProcess> {
     const { database: db, sqs } = fixture.config;
     const ready = deferred<Ready>();
     const child = Bun.spawn([process.execPath, resolve(root, 'test/support/application-process.ts')], {
       cwd: root, stdin: 'pipe', stdout: 'pipe', stderr: 'pipe',
       env: { ...process.env, PORT: '3000', DB_HOST: db.host, DB_PORT: String(db.port), DB_NAME: db.dbName,
         PENDING_REFERENCE_WORKER_ENABLED: String(options.pendingWorkerEnabled ?? false),
+        SQS_CONSUMER_ENABLED: String((options.messagingEnabled ?? false) && (options.messagingInstances?.includes(index) ?? true)),
+        SQS_TRANSACTION_QUEUE_NAME: options.queueName ?? 'wager-transactions.fifo',
+        SQS_DLQ_QUEUE_NAME: options.dlqName ?? 'wager-transactions-dlq.fifo',
+        SQS_SHUTDOWN_TIMEOUT_MS: String(options.shutdownMs ?? 10000),
+        SQS_TEST_PAUSE_BEFORE_ACK: String(options.pauseBeforeAck ?? false),
+        SQS_TEST_VISIBILITY_SECONDS: options.visibilitySeconds === undefined ? '' : String(options.visibilitySeconds),
         DB_USER: db.user, DB_PASSWORD: db.password, SQS_ENDPOINT: sqs.endpoint, AWS_REGION: sqs.region,
         AWS_ACCESS_KEY_ID: sqs.accessKeyId, AWS_SECRET_ACCESS_KEY: sqs.secretAccessKey },
     });
@@ -87,8 +95,8 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
   try {
     await fixture.orm.getMigrator().up();
     // Keep all successful starts for cleanup, even if a different child fails.
-    const starts = await Promise.allSettled(Array.from({ length: instanceCount }, async () => {
-      const instance = await start(); processes.push(instance); return instance;
+    const starts = await Promise.allSettled(Array.from({ length: instanceCount }, async (_, index) => {
+      const instance = await start(index); processes[index] = instance; return instance;
     }));
     const failure = starts.find((r) => r.status === 'rejected');
     if (failure?.status === 'rejected') throw failure.reason;
@@ -96,6 +104,16 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     const sql = <T extends object[] = Record<string, unknown>[]>(statement: string, parameters: unknown[] = []) =>
       fixture.orm.em.getConnection().execute<T>(statement, parameters);
     return { orm: fixture.orm, config: fixture.config,
+      diagnostics: (index: number) => processes[index]!.diagnostics(),
+      resumeAck: (index: number) => { processes[index]!.child.stdin.write('resume-ack\n'); },
+      async terminate(index: number) {
+        const instance = processes[index]!;
+        // Unix uses the real OS signal. Windows dispatches the same Nest signal handler.
+        if (process.platform === 'win32') instance.child.stdin.write('sigterm\n');
+        else instance.child.kill('SIGTERM');
+        await withDeadline(instance.child.exited, 15000, 'SIGTERM shutdown');
+        await instance.drain;
+      },
       instances: () => processes.map(({ pid, url, dbName }) => ({ pid, url, dbName })), sql,
       async post(body: unknown, key: string, instanceIndex = 0): Promise<HttpResult> {
         const instance = processes[instanceIndex % processes.length]!;
@@ -124,7 +142,7 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
       async restart(index: number) {
         const old = processes[index]!;
         await stop(old);
-        const replacement = await start();
+        const replacement = await start(index);
         processes[index] = replacement;
         return { oldPid: old.pid, newPid: replacement.pid };
       },
@@ -133,7 +151,7 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
         old.child.kill('SIGKILL');
         await old.child.exited;
         await old.drain;
-        const replacement = await start();
+        const replacement = await start(index);
         processes[index] = replacement;
         return { oldPid: old.pid, newPid: replacement.pid };
       },
@@ -150,6 +168,7 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     throw error;
   }
 }
+
 
 export function processWagerBody(wallet: TestWallet, kind = 'BET', amount = '25.00', overrides: Record<string, unknown> = {}) {
   return { providerId: 'phase4-provider', externalTransactionId: crypto.randomUUID(), playerId: wallet.playerId,

@@ -7,5 +7,5 @@ import { WageringController } from './wagering.controller';
 @Module({ imports: [PersistenceModule], controllers: [WageringController], providers: [
   { provide: ProcessWagerTransactionUseCase, inject: [TRANSACTION_MANAGER],
     useFactory: (transactions: TransactionManager) => new ProcessWagerTransactionUseCase(transactions) },
-] })
+], exports: [ProcessWagerTransactionUseCase] })
 export class WageringModule {}

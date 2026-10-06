@@ -20,6 +20,7 @@ function port(env: Environment, key: string, fallback: string): number {
 
 @Injectable()
 export class AppConfig {
+  readonly messaging: Readonly<{ enabled: boolean; queueName: string; dlqName: string; shutdownMs: number }>;
   readonly pendingReferenceWorkerEnabled: boolean;
   readonly port: number;
   readonly database: Readonly<{
@@ -31,6 +32,14 @@ export class AppConfig {
 
   constructor() {
     const env = process.env;
+    const messagingEnabled = env.SQS_CONSUMER_ENABLED ?? 'true';
+    if (!['true', 'false'].includes(messagingEnabled)) throw new Error('Invalid configuration: SQS_CONSUMER_ENABLED');
+    const shutdownMs = Number(env.SQS_SHUTDOWN_TIMEOUT_MS ?? '10000');
+    if (!Number.isInteger(shutdownMs) || shutdownMs < 100 || shutdownMs > 30000) throw new Error('Invalid configuration: SQS_SHUTDOWN_TIMEOUT_MS');
+    const queueName = text(env, 'SQS_TRANSACTION_QUEUE_NAME', 'wager-transactions.fifo');
+    const dlqName = text(env, 'SQS_DLQ_QUEUE_NAME', 'wager-transactions-dlq.fifo');
+    if (![queueName, dlqName].every((name) => name.length <= 80 && /^[\w-]+\.fifo$/.test(name)) || queueName === dlqName) throw new Error('Invalid FIFO queue configuration');
+    this.messaging = Object.freeze({ enabled: messagingEnabled === 'true', queueName, dlqName, shutdownMs });
     const pendingWorker = env.PENDING_REFERENCE_WORKER_ENABLED ?? 'true';
     if (!['true', 'false'].includes(pendingWorker)) throw new Error('Invalid configuration: PENDING_REFERENCE_WORKER_ENABLED');
     this.pendingReferenceWorkerEnabled = pendingWorker === 'true';

@@ -15,7 +15,7 @@ async function main(): Promise<void> {
     await sqs.check();
     console.log('SQS: required FIFO queues reachable');
   } finally {
-    sqs.onModuleDestroy();
+    sqs.onApplicationShutdown();
     await orm.close(true);
   }
 }

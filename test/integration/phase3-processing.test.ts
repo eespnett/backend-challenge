@@ -308,6 +308,7 @@ describe('Phase 3 processing via HTTP and real PostgreSQL', () => {
       const rejected = await new ProcessWagerTransactionUseCase(manager).execute(
         wagerBody(wallet,Kind.Bet,'25.00',{money:{amount:'25.00',currency:'USD'}}),crypto.randomUUID());
       expect(rejected.httpStatus).toBe(422);
+      await fixture.orm.getMigrator().down(); // Phase 6 messaging tables.
       await fixture.orm.getMigrator().down(); // Phase 5 has no incompatible codes in this fixture.
       await expect(fixture.orm.getMigrator().down()).rejects.toThrow();
       const connection=fixture.orm.em.getConnection();
