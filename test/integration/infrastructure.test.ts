@@ -9,6 +9,7 @@ import { AppConfig } from '../../src/config/app-config';
 import { createOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { SqsService } from '../../src/infrastructure/sqs/sqs.service';
 import { createTestApp } from '../support/create-test-app';
+import { isolatedQueues } from '../support/phase6-harness';
 
 test('real PostgreSQL connection and versioned migration', async () => {
   const orm = await MikroORM.init(createOrmConfig(new AppConfig()));
@@ -27,13 +28,15 @@ test('real PostgreSQL connection and versioned migration', async () => {
 });
 
 test('real LocalStack FIFO send, receive, delete and DLQ policy', async () => {
-  const sqs = new SqsService(new AppConfig());
+  // Production consumers may be polling concurrently; never send probes to their command queue.
+  const queues = await isolatedQueues();
+  const sqs = queues.sqs;
   let receipt: string | undefined;
-  const QueueUrl = await sqs.queueUrl('wager-transactions.fifo');
+  const QueueUrl = queues.queueUrl;
   try {
     await sqs.check();
     const attributes = await sqs.client.send(new GetQueueAttributesCommand({
-      QueueUrl, AttributeNames: ['FifoQueue', 'RedrivePolicy'],
+      QueueUrl:await sqs.queueUrl('wager-transactions.fifo'), AttributeNames: ['FifoQueue', 'RedrivePolicy'],
     }));
     expect(attributes.Attributes?.FifoQueue).toBe('true');
     const policy = JSON.parse(attributes.Attributes?.RedrivePolicy ?? '{}') as {
@@ -56,7 +59,7 @@ test('real LocalStack FIFO send, receive, delete and DLQ policy', async () => {
     expect(receipt).toBeDefined();
   } finally {
     if (receipt) await sqs.client.send(new DeleteMessageCommand({ QueueUrl, ReceiptHandle: receipt }));
-    sqs.onApplicationShutdown();
+    await queues.close();
   }
 });
 

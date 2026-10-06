@@ -4,7 +4,8 @@ import { AppConfig } from '../../src/config/app-config';
 const originalPort = process.env.PORT;
 const originalEndpoint = process.env.SQS_ENDPOINT;
 const originalPendingWorker = process.env.PENDING_REFERENCE_WORKER_ENABLED;
-const messagingKeys = ['SQS_CONSUMER_ENABLED','SQS_TRANSACTION_QUEUE_NAME','SQS_DLQ_QUEUE_NAME','SQS_SHUTDOWN_TIMEOUT_MS'] as const;
+const messagingKeys = ['SQS_CONSUMER_ENABLED','SQS_TRANSACTION_QUEUE_NAME','SQS_DLQ_QUEUE_NAME','SQS_SHUTDOWN_TIMEOUT_MS',
+  'OUTBOX_PUBLISHER_ENABLED','EVENT_CONSUMER_ENABLED','SQS_EVENT_QUEUE_NAME','OUTBOX_LEASE_MS'] as const;
 const originalMessaging = Object.fromEntries(messagingKeys.map((key) => [key,process.env[key]]));
 afterEach(() => {
   if (originalPort === undefined) delete process.env.PORT;
@@ -20,6 +21,14 @@ afterEach(() => {
 });
 
 describe('AppConfig', () => {
+  test('outbox defaults and worker/queue/lease validation',()=>{
+    for(const key of messagingKeys)delete process.env[key];
+    expect(new AppConfig().outbox).toEqual({publisherEnabled:true,consumerEnabled:true,queueName:'wager-events.fifo',leaseMs:30000});
+    process.env.OUTBOX_PUBLISHER_ENABLED='false';expect(new AppConfig().outbox.publisherEnabled).toBe(false);
+    process.env.EVENT_CONSUMER_ENABLED='maybe';expect(()=>new AppConfig()).toThrow('outbox worker');
+    process.env.EVENT_CONSUMER_ENABLED='false';process.env.SQS_EVENT_QUEUE_NAME='wager-transactions.fifo';expect(()=>new AppConfig()).toThrow('separate');
+    delete process.env.SQS_EVENT_QUEUE_NAME;process.env.OUTBOX_LEASE_MS='99';expect(()=>new AppConfig()).toThrow('OUTBOX_LEASE_MS');
+  });
   test('SQS consumer defaults and invalid worker/queue/shutdown settings', () => {
     for (const key of messagingKeys) delete process.env[key];
     expect(new AppConfig().messaging).toEqual({ enabled:true,queueName:'wager-transactions.fifo',

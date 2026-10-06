@@ -17,7 +17,10 @@ interface ApplicationProcess extends Ready { child: Subprocess<'pipe', 'pipe', '
 
 export async function processHarness(instanceCount = 3, options: { pendingWorkerEnabled?: boolean; messagingEnabled?: boolean;
   queueName?: string; dlqName?: string; shutdownMs?: number; pauseBeforeAck?: boolean;
-  visibilitySeconds?: number; messagingInstances?: readonly number[] } = {}) {
+  visibilitySeconds?: number; messagingInstances?: readonly number[]; outboxPublisherEnabled?: boolean;
+  eventConsumerEnabled?: boolean; eventQueueName?: string; outboxLeaseMs?: number;
+  publisherInstances?: readonly number[]; eventConsumerInstances?: readonly number[];
+  pauseBeforePublish?: boolean; pauseAfterPublish?: boolean } = {}) {
   if (!Number.isInteger(instanceCount) || instanceCount < 3) throw new Error('At least three real processes are required');
   const fixture = await isolatedPostgres();
   const processes: ApplicationProcess[] = [];
@@ -47,6 +50,12 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
         SQS_SHUTDOWN_TIMEOUT_MS: String(options.shutdownMs ?? 10000),
         SQS_TEST_PAUSE_BEFORE_ACK: String(options.pauseBeforeAck ?? false),
         SQS_TEST_VISIBILITY_SECONDS: options.visibilitySeconds === undefined ? '' : String(options.visibilitySeconds),
+        OUTBOX_PUBLISHER_ENABLED: String((options.outboxPublisherEnabled??false)&&(options.publisherInstances?.includes(index)??true)),
+        EVENT_CONSUMER_ENABLED: String((options.eventConsumerEnabled??false)&&(options.eventConsumerInstances?.includes(index)??true)),
+        SQS_EVENT_QUEUE_NAME: options.eventQueueName??'wager-events.fifo',
+        OUTBOX_LEASE_MS: String(options.outboxLeaseMs??30000),
+        OUTBOX_TEST_PAUSE_BEFORE_SEND: String(options.pauseBeforePublish??false),
+        OUTBOX_TEST_PAUSE_AFTER_SEND: String(options.pauseAfterPublish??false),
         DB_USER: db.user, DB_PASSWORD: db.password, SQS_ENDPOINT: sqs.endpoint, AWS_REGION: sqs.region,
         AWS_ACCESS_KEY_ID: sqs.accessKeyId, AWS_SECRET_ACCESS_KEY: sqs.secretAccessKey },
     });
@@ -106,6 +115,14 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     return { orm: fixture.orm, config: fixture.config,
       diagnostics: (index: number) => processes[index]!.diagnostics(),
       resumeAck: (index: number) => { processes[index]!.child.stdin.write('resume-ack\n'); },
+      resumePublish: (index: number) => { processes[index]!.child.stdin.write('resume-publish\n'); },
+      async restartAll(){
+        const oldPids=processes.map((p)=>p.pid);
+        await Promise.all(processes.map(stop));
+        const started=await Promise.allSettled(processes.map(async(_,index)=>{const replacement=await start(index);processes[index]=replacement;return replacement;}));
+        const failure=started.find((result)=>result.status==='rejected');if(failure?.status==='rejected')throw failure.reason;
+        return {oldPids,newPids:processes.map((p)=>p.pid)};
+      },
       async terminate(index: number) {
         const instance = processes[index]!;
         // Unix uses the real OS signal. Windows dispatches the same Nest signal handler.
@@ -155,7 +172,7 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
         processes[index] = replacement;
         return { oldPid: old.pid, newPid: replacement.pid };
       },
-      assertConsistent: () => assertLedgerConsistency(fixture.orm),
+      assertConsistent: () => assertLedgerConsistency(fixture.orm,{allowPublished:options.outboxPublisherEnabled??false}),
       async close() {
         const stopped = await Promise.allSettled(processes.map(stop));
         await fixture.dispose();

@@ -20,6 +20,7 @@ function port(env: Environment, key: string, fallback: string): number {
 
 @Injectable()
 export class AppConfig {
+  readonly outbox: Readonly<{ publisherEnabled: boolean; consumerEnabled: boolean; queueName: string; leaseMs: number }>;
   readonly messaging: Readonly<{ enabled: boolean; queueName: string; dlqName: string; shutdownMs: number }>;
   readonly pendingReferenceWorkerEnabled: boolean;
   readonly port: number;
@@ -32,6 +33,12 @@ export class AppConfig {
 
   constructor() {
     const env = process.env;
+    const publisher=env.OUTBOX_PUBLISHER_ENABLED??'true';
+    const eventConsumer=env.EVENT_CONSUMER_ENABLED??'true';
+    if(!['true','false'].includes(publisher)||!['true','false'].includes(eventConsumer))throw new Error('Invalid outbox worker configuration');
+    const eventQueue=text(env,'SQS_EVENT_QUEUE_NAME','wager-events.fifo');
+    const leaseMs=Number(env.OUTBOX_LEASE_MS??'30000');
+    if(!Number.isInteger(leaseMs)||leaseMs<100||leaseMs>300000)throw new Error('Invalid configuration: OUTBOX_LEASE_MS');
     const messagingEnabled = env.SQS_CONSUMER_ENABLED ?? 'true';
     if (!['true', 'false'].includes(messagingEnabled)) throw new Error('Invalid configuration: SQS_CONSUMER_ENABLED');
     const shutdownMs = Number(env.SQS_SHUTDOWN_TIMEOUT_MS ?? '10000');
@@ -39,6 +46,8 @@ export class AppConfig {
     const queueName = text(env, 'SQS_TRANSACTION_QUEUE_NAME', 'wager-transactions.fifo');
     const dlqName = text(env, 'SQS_DLQ_QUEUE_NAME', 'wager-transactions-dlq.fifo');
     if (![queueName, dlqName].every((name) => name.length <= 80 && /^[\w-]+\.fifo$/.test(name)) || queueName === dlqName) throw new Error('Invalid FIFO queue configuration');
+    if(eventQueue.length>80||! /^[\w-]+\.fifo$/.test(eventQueue)||[queueName,dlqName].includes(eventQueue))throw new Error('Event FIFO must be separate');
+    this.outbox=Object.freeze({publisherEnabled:publisher==='true',consumerEnabled:eventConsumer==='true',queueName:eventQueue,leaseMs});
     this.messaging = Object.freeze({ enabled: messagingEnabled === 'true', queueName, dlqName, shutdownMs });
     const pendingWorker = env.PENDING_REFERENCE_WORKER_ENABLED ?? 'true';
     if (!['true', 'false'].includes(pendingWorker)) throw new Error('Invalid configuration: PENDING_REFERENCE_WORKER_ENABLED');

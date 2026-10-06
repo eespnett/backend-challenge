@@ -52,6 +52,10 @@ services:
       SQS_TRANSACTION_QUEUE_NAME: "${SQS_TRANSACTION_QUEUE_NAME:-wager-transactions.fifo}"
       SQS_DLQ_QUEUE_NAME: "${SQS_DLQ_QUEUE_NAME:-wager-transactions-dlq.fifo}"
       SQS_SHUTDOWN_TIMEOUT_MS: "${SQS_SHUTDOWN_TIMEOUT_MS:-10000}"
+      OUTBOX_PUBLISHER_ENABLED: "${OUTBOX_PUBLISHER_ENABLED:-true}"
+      EVENT_CONSUMER_ENABLED: "${EVENT_CONSUMER_ENABLED:-true}"
+      SQS_EVENT_QUEUE_NAME: "${SQS_EVENT_QUEUE_NAME:-wager-events.fifo}"
+      OUTBOX_LEASE_MS: "${OUTBOX_LEASE_MS:-30000}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -15,6 +15,7 @@
     "test:integration": "bun test test/integration --timeout 30000",
     "test:concurrency": "bun test test/concurrency --timeout 30000",
     "test:messaging": "bun test test/integration/phase6-messaging.test.ts test/concurrency/phase6-sqs-processes.test.ts --timeout 30000",
+    "test:outbox": "bun test test/unit/outbox.test.ts test/integration/phase7-outbox.test.ts test/concurrency/phase7-outbox-crashes.test.ts --timeout 30000",
     "migration:up": "bun scripts/migrate.ts up",
     "migration:down": "bun scripts/migrate.ts down",
     "migration:list": "bun scripts/migrate.ts list",

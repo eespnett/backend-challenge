@@ -15,6 +15,6 @@ awslocal sqs create-queue \
 
 awslocal sqs create-queue \
   --queue-name wager-events.fifo \
-  --attributes '{"FifoQueue":"true","VisibilityTimeout":"30"}'
+  --attributes '{"FifoQueue":"true","VisibilityTimeout":"30","MessageRetentionPeriod":"1209600"}'
 
 touch /tmp/wagering-queues-ready

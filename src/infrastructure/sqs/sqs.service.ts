@@ -37,7 +37,7 @@ export class SqsService implements OnApplicationShutdown {
   }
 
   async check(): Promise<void> {
-    await Promise.all([this.config.messaging.queueName, this.config.messaging.dlqName, 'wager-events.fifo'].map(async (name) => {
+    await Promise.all([this.config.messaging.queueName, this.config.messaging.dlqName, this.config.outbox.queueName].map(async (name) => {
       const QueueUrl = await this.queueUrl(name);
       await this.client.send(
         new GetQueueAttributesCommand({ QueueUrl, AttributeNames: ['QueueArn'] }),

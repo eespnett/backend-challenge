@@ -2,7 +2,7 @@ import { expect } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 
 /** All arithmetic stays inside PostgreSQL NUMERIC; returned money remains text. */
-export async function assertLedgerConsistency(orm: MikroORM) {
+export async function assertLedgerConsistency(orm: MikroORM, options: { allowPublished?: boolean } = {}) {
   const connection = orm.em.getConnection();
   const mismatches = await connection.execute<Array<{ id: string; balance: string; reconstructed: string }>>(`
     select w.id,w.balance::text,coalesce(sum(case l.direction when 'CREDIT' then l.amount else -l.amount end),0)::text as reconstructed
@@ -17,5 +17,5 @@ export async function assertLedgerConsistency(orm: MikroORM) {
     join wagering.wager_transactions t on t.id=l.transaction_id
     where t.status<>'PROCESSED' or t.kind='LOSS' or l.currency<>t.currency or l.amount<>t.amount`);
   expect(invalidLedger).toEqual([]);
-  expect(await connection.execute('select id from wagering.outbox_events where published_at is not null')).toEqual([]);
+  if(!options.allowPublished)expect(await connection.execute('select id from wagering.outbox_events where published_at is not null')).toEqual([]);
 }

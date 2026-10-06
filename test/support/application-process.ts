@@ -5,17 +5,32 @@ import { createInterface } from 'node:readline';
 import { AppModule } from '../../src/app.module';
 import { AppConfig } from '../../src/config/app-config';
 import { SqsService } from '../../src/infrastructure/sqs/sqs.service';
-import { DeleteMessageCommand, ReceiveMessageCommand } from '@aws-sdk/client-sqs';
+import { DeleteMessageCommand, ReceiveMessageCommand, SendMessageCommand } from '@aws-sdk/client-sqs';
 
 async function main() {
   const app = await NestFactory.create(AppModule, { logger: false, abortOnError: false });
   let resumeAck!: () => void;
   const ackGate = new Promise<void>((resolve) => { resumeAck = resolve; });
-  if (process.env.SQS_TEST_PAUSE_BEFORE_ACK === 'true' || process.env.SQS_TEST_VISIBILITY_SECONDS) {
+  let resumePublish!:()=>void;
+  const publishGate=new Promise<void>((resolve)=>{resumePublish=resolve;});
+  const beforeSend=process.env.OUTBOX_TEST_PAUSE_BEFORE_SEND==='true';
+  const afterSend=process.env.OUTBOX_TEST_PAUSE_AFTER_SEND==='true';
+  if (process.env.SQS_TEST_PAUSE_BEFORE_ACK === 'true' || process.env.SQS_TEST_VISIBILITY_SECONDS || beforeSend || afterSend) {
     const client = app.get(SqsService).client;
     const send = client.send.bind(client);
     // Test-only crash window: real SQL has committed; DeleteMessage has not been sent.
     client.send = (async (command: unknown, options: unknown) => {
+      const eventSend=command instanceof SendMessageCommand&&command.input.QueueUrl?.includes(app.get(AppConfig).outbox.queueName);
+      const pausePublish=async(stage:string)=>{
+        console.log(JSON.stringify({type:stage,pid:process.pid,eventId:(command as SendMessageCommand).input.MessageDeduplicationId}));
+        const signal=(options as {abortSignal?:AbortSignal})?.abortSignal;
+        await new Promise<void>((resolve,reject)=>{
+          const abort=()=>reject(new Error('Publisher shutdown'));signal?.addEventListener('abort',abort,{once:true});
+          if(signal?.aborted)abort();
+          void publishGate.then(()=>{signal?.removeEventListener('abort',abort);resolve();});
+        });
+      };
+      if(eventSend&&beforeSend)await pausePublish('outbox-before-send');
       if (command instanceof ReceiveMessageCommand && process.env.SQS_TEST_VISIBILITY_SECONDS) {
         command.input.VisibilityTimeout = Number(process.env.SQS_TEST_VISIBILITY_SECONDS);
       }
@@ -29,7 +44,9 @@ async function main() {
           void ackGate.then(() => { signal?.removeEventListener('abort', abort); resolve(); });
         });
       }
-      return send(command as never, options as never);
+      const response=await send(command as never, options as never);
+      if(eventSend&&afterSend)await pausePublish('outbox-after-send');
+      return response;
     }) as typeof client.send;
   }
   app.enableShutdownHooks();
@@ -49,6 +66,7 @@ async function main() {
     if (line === 'shutdown') void close();
     if (line === 'sigterm') process.emit('SIGTERM', 'SIGTERM');
     if (line === 'resume-ack') resumeAck();
+    if (line === 'resume-publish') resumePublish();
   });
   input.on('close', () => { void close(); });
 }

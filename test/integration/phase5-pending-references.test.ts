@@ -289,6 +289,7 @@ describe('durable pending references on real PostgreSQL',()=>{
     // REFERENCE_NOT_FOUND is an older code; use an existing unprocessable reference for the new code.
     await pendingRawBet(wagerBody(wallet,Kind.Bet,'25.00',{externalTransactionId:'missing'}));
     expect(await reprocess.execute(await claim(pending.body.transactionId))).toBe('EXPIRED');
+    await h.orm.getMigrator().down(); // Phase 7 publisher metadata/receipts.
     await h.orm.getMigrator().down(); // Phase 6 has no inbox deliveries in this fixture.
     await expect(h.orm.getMigrator().down()).rejects.toThrow();
     expect((await jobState(pending.body.transactionId)).status).toBe('EXPIRED');
