@@ -3,6 +3,7 @@ import { MikroORM } from '@mikro-orm/postgresql';
 import { AppConfig } from '../src/config/app-config';
 import { createOrmConfig } from '../src/infrastructure/persistence/mikro-orm.config';
 import { SqsService } from '../src/infrastructure/sqs/sqs.service';
+import { runCli } from './cli';
 
 async function main(): Promise<void> {
   const config = new AppConfig();
@@ -20,7 +21,4 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+void runCli('infrastructure_check_failed', main);

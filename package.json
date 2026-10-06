@@ -19,7 +19,15 @@
     "migration:up": "bun scripts/migrate.ts up",
     "migration:down": "bun scripts/migrate.ts down",
     "migration:list": "bun scripts/migrate.ts list",
-    "check:infra": "bun scripts/check-infrastructure.ts"
+    "check:infra": "bun scripts/check-infrastructure.ts",
+    "seed": "bun scripts/seed.ts",
+    "send-wager": "bun scripts/send-wager.ts",
+    "verify": "bun scripts/verify.ts",
+    "test:crash": "bun test test/concurrency/phase5-pending-workers.test.ts test/concurrency/phase6-sqs-processes.test.ts test/concurrency/phase7-outbox-crashes.test.ts --timeout 30000",
+    "infra:up": "docker compose up -d --wait postgres localstack",
+    "infra:down": "docker compose down",
+    "infra:reset": "docker compose down -v",
+    "compose:up": "docker compose up -d --build --wait app"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "3.922.0",

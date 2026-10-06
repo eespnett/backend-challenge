@@ -73,7 +73,7 @@ services:
     healthcheck:
       test: ["CMD", "bun", "-e", "const r = await fetch('http://localhost:3000/health/ready'); process.exit(r.ok ? 0 : 1)"]
       interval: 5s
-      timeout: 5s
+      timeout: 8s
       retries: 12
       start_period: 10s
     stop_grace_period: 30s

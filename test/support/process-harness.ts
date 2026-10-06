@@ -89,10 +89,23 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     try {
       const info = await withDeadline(ready.promise, 15000, 'application process bootstrap');
       const instance = { ...info, child, drain: draining, diagnostics: () => log };
-      // Must exceed the readiness service's 6s probe deadline so a 503 can be observed.
-      const response = await fetch(`${info.url}/health/ready`, { signal: AbortSignal.timeout(8000) });
-      if (!response.ok) throw new Error(`Child readiness returned ${response.status}`);
-      return instance;
+      // A listening process can still be warming its database/SQS connections.
+      // Retry only startup probes; require a real 200 within a bounded total deadline.
+      const deadline = performance.now() + 20000;
+      let lastStatus = 'probe timed out or failed';
+      while (performance.now() < deadline) {
+        try {
+          // Normally exceeds the service's 6s probe deadline to observe a 503.
+          const response = await fetch(`${info.url}/health/ready`, {
+            signal: AbortSignal.timeout(Math.max(1, Math.ceil(Math.min(8000, deadline - performance.now())))),
+          });
+          await response.arrayBuffer();
+          if (response.ok) return instance;
+          lastStatus = `HTTP ${response.status}`;
+        } catch { lastStatus = 'probe timed out or failed'; }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error(`Child readiness deadline exceeded (${lastStatus})`);
     } catch (error) {
       child.kill();
       await child.exited;

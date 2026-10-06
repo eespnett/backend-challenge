@@ -744,3 +744,271 @@ wallet.balance == saldo reconstruído pelo ledger
 ### Diferenciais opcionais
 
 Teste de carga também conta como diferencial. Se fizer, exponha como `bun run test:load` e registre ambiente, metodologia, throughput, p50/p95/p99, taxa de erro, conflitos de concorrência e outbox lag. Não há meta de RPS — a qualidade do experimento e a honestidade da análise pesam mais que o número bruto.
+
+---
+
+## Execução da solução entregue
+
+O enunciado original está preservado acima. A solução implementa as fases 0–9,
+com PostgreSQL e SQS/LocalStack reais, sem autenticação real, dashboard, OTel ou
+teste de carga opcional. Decisões, limitações e checklist dos 100 pontos estão em
+[ARCHITECTURE.md](ARCHITECTURE.md).
+
+### Pré-requisitos
+
+- Bun **1.4.2** no PATH (runtime usado na validação; dependências em `bun.lock`).
+- Docker com engine de containers Linux e Docker Compose **2.20+**.
+- Windows: Docker Desktop com WSL2; Linux/macOS: engine Docker funcionando.
+- Portas locais livres: `5432` (PostgreSQL), `4566` (LocalStack), `3000` (HTTP).
+- Git. Os exemplos `curl` abaixo usam Bash; há uma alternativa PowerShell.
+
+Não é necessário instalar PostgreSQL, AWS CLI ou Node.js no host. O hook do
+LocalStack cria as três filas FIFO; `.gitattributes` garante LF nesse script.
+As credenciais de `.env.example` são fictícias para desenvolvimento local.
+
+### Caminho rápido: aplicação completa no Docker Compose
+
+Executar na raiz do repositório:
+
+```sh
+bun install --frozen-lockfile
+docker compose up -d --build --wait app
+docker compose ps -a
+bun run check:infra
+bun run seed
+bun run send-wager --external-transaction-id demo-sqs-bet-001 --idempotency-key demo-sqs-key-001
+```
+
+O Compose inicia PostgreSQL 17.6 e LocalStack 4.0.3, aguarda saúde, executa todas
+as migrations e inicia a aplicação em `http://127.0.0.1:3000`. O serviço `migrate`
+terminar com código 0 é esperado. Os workers de comandos, referências pendentes,
+outbox e recibos de eventos ficam habilitados por padrão.
+
+`seed` cria a wallet `demo-player`/`BRL` com `100.00` pelo caso de uso existente,
+incluindo OPENING, ledger e outbox na mesma transação. Repetir o comando reutiliza
+a identidade persistida e **não restaura nem sobrescreve** o saldo atual.
+`send-wager` sem IDs usa essa wallet e envia uma BET de `25.00` para a FIFO real.
+O comando confirma envio SQS; o efeito financeiro é assíncrono. Para consultá-lo:
+
+```sh
+curl http://127.0.0.1:3000/providers/demo-provider/wagering/transactions/demo-sqs-bet-001
+```
+
+Um 404 imediatamente após envio pode significar que o consumidor ainda não
+processou a mensagem. Repetir a consulta depois do polling. Repetir `send-wager`
+com a mesma chave e identidade externa gera nova entrega de transporte e replay
+persistente, sem outro débito.
+
+### Aplicação Bun no host
+
+```sh
+bun install --frozen-lockfile
+bun run infra:up
+bun run migration:up
+bun run check:infra
+bun run seed
+bun run start
+```
+
+Para desenvolvimento com reload: `bun run start:dev`. Se a aplicação Docker
+estiver em execução, usar `docker compose stop app` antes de iniciar no host,
+para liberar a porta 3000. Não há necessidade de `.env`: os defaults são locais.
+Se desejado, copiar `.env.example` para `.env` (`cp` no Bash ou `Copy-Item` no
+PowerShell). Bun carrega `.env`; o Compose fornece host/endpoint da rede Docker.
+Customização de credenciais PostgreSQL deve ser feita de forma coerente no
+Compose e no ambiente do host. Não versionar `.env` com dados reais.
+
+### Migrations e validação
+
+```sh
+bun run migration:up
+bun run migration:list
+bun run typecheck
+bun run test
+bun run test:integration
+bun run test:concurrency
+```
+
+`migration:list` lista migrations **pendentes**; `[]` indica schema atualizado.
+UP repetido não duplica histórico. DOWN reverte uma migration por chamada e deve
+ser usado somente em banco descartável: `bun run migration:down`. Alguns
+downgrades recusam dados incompatíveis, preservando-os em vez de apagá-los.
+
+Para a validação completa, sequencial e com parada na primeira falha:
+
+```sh
+bun run verify
+```
+
+Esse comando executa typecheck, unitários/smoke, integração/health,
+concorrência/crash recovery e typecheck final. Requer PostgreSQL, LocalStack e as
+filas ativos; `bun run infra:up` e `bun run migration:up` preparam esse estado.
+Os testes criam bancos e filas aleatórios, exigindo CREATEDB no usuário local;
+não usar credenciais ou serviços de produção. As suítes devem rodar sequencialmente
+para evitar competição por recursos nos timeouts curtos de infraestrutura.
+
+Seleções úteis:
+
+```sh
+bun run test:smoke
+bun run test:messaging
+bun run test:outbox
+bun run test:crash
+bun test test/integration/phase8-health.test.ts --timeout 30000
+bun test test/integration/phase9-delivery-scripts.test.ts --timeout 30000
+```
+
+Concorrência usa três processos Bun reais, 50 submissões simultâneas, restart,
+SIGKILL e pausas de crash exclusivas dos testes. No Windows, o teste de shutdown
+aciona o handler Nest equivalente a SIGTERM; SIGKILL encerra o processo real.
+
+Para validar SIGTERM POSIX real no Linux usando a imagem construída:
+
+```sh
+docker compose run --rm --no-deps app bun test test/concurrency/phase6-sqs-processes.test.ts --test-name-pattern SIGTERM --timeout 30000
+```
+
+### Health e métricas
+
+```sh
+curl http://127.0.0.1:3000/health/live
+curl http://127.0.0.1:3000/health/ready
+curl http://127.0.0.1:3000/metrics
+docker compose logs --tail 50 app
+```
+
+Live retorna `{"status":"ok"}` sem consultar dependências. Ready verifica
+PostgreSQL e as três filas SQS; retorna 200 ou 503 com `checks.postgres` e
+`checks.sqs`. `/metrics` expõe texto Prometheus. Logs são JSON sem bodies
+financeiros ou credenciais. Counters/histogramas reiniciam por processo; gauges
+SQL/SQS representam estado compartilhado, incluindo profundidade aproximada da DLQ.
+
+### Exemplos HTTP (Bash)
+
+Criar uma wallet e copiar seu `id` da resposta:
+
+```sh
+curl -i -X POST http://127.0.0.1:3000/wallets \
+  -H 'Content-Type: application/json' \
+  --data '{"playerId":"demo-http-player","initialBalance":{"amount":"100.00","currency":"BRL"}}'
+WALLET_ID='<id retornado>'
+```
+
+Enviar uma BET; repetir exatamente o mesmo comando demonstra replay:
+
+```sh
+curl -i -X POST http://127.0.0.1:3000/wagering/transactions \
+  -H 'Content-Type: application/json' \
+  -H 'Idempotency-Key: demo-http-key-001' \
+  -H 'X-Correlation-Id: demo-http-corr-001' \
+  --data "{\"providerId\":\"demo-http-provider\",\"externalTransactionId\":\"demo-http-bet-001\",\"playerId\":\"demo-http-player\",\"walletId\":\"$WALLET_ID\",\"roundId\":\"demo-round\",\"gameId\":\"demo-game\",\"kind\":\"BET\",\"money\":{\"amount\":\"25.00\",\"currency\":\"BRL\"}}"
+```
+
+Consultas e reconciliação:
+
+```sh
+TRANSACTION_ID='<transactionId retornado>'
+curl "http://127.0.0.1:3000/wallets/$WALLET_ID"
+curl "http://127.0.0.1:3000/wallets/$WALLET_ID/ledger?limit=50"
+curl "http://127.0.0.1:3000/wagering/transactions/$TRANSACTION_ID"
+curl http://127.0.0.1:3000/providers/demo-http-provider/wagering/transactions/demo-http-bet-001
+curl -X POST "http://127.0.0.1:3000/wallets/$WALLET_ID/reconciliation"
+```
+
+Para a página seguinte, enviar o `nextCursor` retornado em `?cursor=TOKEN&limit=50`;
+`null` encerra a paginação. Limite de 1–100, sem offset. Reconciliação retorna
+valores `{amount,currency}`; `difference = storedBalance - calculatedBalance`.
+Ela nunca corrige saldo. REFUND/ROLLBACK exigem `referenceExternalTransactionId`;
+referência ainda não encontrada gera HTTP 202 e reprocessamento persistente posterior.
+Erros: 400 validação, 404 consultas ausentes, 409 conflito de identidade/payload,
+422 rejeição financeira, 503 infraestrutura transitória.
+
+### Exemplo HTTP (PowerShell)
+
+```powershell
+$seed = bun scripts/seed.ts | ConvertFrom-Json
+$body = @{
+  providerId = 'demo-powershell-provider'
+  externalTransactionId = 'demo-powershell-bet-001'
+  playerId = $seed.playerId
+  walletId = $seed.walletId
+  roundId = 'demo-round'
+  gameId = 'demo-game'
+  kind = 'BET'
+  money = @{ amount = '25.00'; currency = 'BRL' }
+} | ConvertTo-Json -Depth 4
+$result = Invoke-RestMethod -Method Post -Uri http://127.0.0.1:3000/wagering/transactions -ContentType 'application/json' -Headers @{ 'Idempotency-Key' = 'demo-powershell-key-001' } -Body $body
+Invoke-RestMethod "http://127.0.0.1:3000/wallets/$($seed.walletId)"
+Invoke-RestMethod "http://127.0.0.1:3000/wallets/$($seed.walletId)/ledger?limit=50"
+Invoke-RestMethod "http://127.0.0.1:3000/wagering/transactions/$($result.transactionId)"
+Invoke-RestMethod -Method Post "http://127.0.0.1:3000/wallets/$($seed.walletId)/reconciliation"
+Invoke-RestMethod http://127.0.0.1:3000/health/ready
+```
+
+### Mensagens SQS e identidade de replay
+
+O script usa o SDK AWS e a fila `wager-transactions.fifo`, com group por wallet e
+deduplication ID por `messageId`. Exemplos:
+
+```sh
+bun run send-wager --kind WIN --amount 10.00 --external-transaction-id demo-win-001
+bun run send-wager --kind REFUND --amount 25.00 --reference-external-transaction-id demo-sqs-bet-001
+bun run send-wager --wallet-id '<UUID>' --player-id '<ID>' --provider-id demo-provider --kind LOSS --amount 0.00
+bun run send-wager --file .local/wager-envelope.json
+```
+
+`--file` aceita o envelope completo abaixo, sem combinar overrides. Substituir a
+wallet pela identidade retornada por seed; guardar o arquivo em `.local/`, ignorado
+pelo Git/build. Reenviar o mesmo arquivo preserva IDs, timestamp e payload.
+Se gerar comandos separados com o mesmo `--message-id`, mas outro timestamp,
+o hash do inbox poderá detectar conflito; usar o arquivo para replay de transporte.
+
+```json
+{
+  "messageId": "demo-file-message-001",
+  "type": "WagerTransactionRequested",
+  "occurredAt": "2026-10-05T12:00:00.000Z",
+  "data": {
+    "idempotencyKey": "demo-file-key-001",
+    "providerId": "demo-provider",
+    "externalTransactionId": "demo-file-bet-001",
+    "playerId": "demo-player",
+    "walletId": "<UUID retornado pelo seed>",
+    "roundId": "demo-round",
+    "gameId": "demo-game",
+    "kind": "BET",
+    "money": { "amount": "25.00", "currency": "BRL" }
+  }
+}
+```
+
+Não enviar comandos para `wager-events.fifo`: ela recebe fatos confirmados da
+outbox e tem consumidor mínimo com deduplicação persistente. A garantia financeira
+não depende da janela de deduplicação FIFO de cinco minutos.
+
+### Ambiente novo e limpeza
+
+Este ciclo remove **os dados locais do projeto**, incluindo o volume PostgreSQL:
+
+```sh
+docker compose down -v
+docker compose build --no-cache
+docker compose up -d --wait app
+bun install --frozen-lockfile
+bun run migration:list
+bun run check:infra
+bun run verify
+bun run seed
+```
+
+Para parar sem remover o volume PostgreSQL: `docker compose down` ou
+`bun run infra:down`. Para resetar dados locais: `bun run infra:reset`.
+LocalStack deste Compose é efêmero: filas/mensagens não sobrevivem à remoção do
+container, mesmo se o volume PostgreSQL for preservado. Não tratar essa topologia
+local como armazenamento durável de produção.
+
+`.env`, `.local/`, `*.log`, `*.tmp`, `*.tsbuildinfo`, `node_modules`, `coverage` e
+`dist` ficam fora do Git; logs/artefatos locais também ficam fora do contexto Docker.
+Os nomes das filas do hook são os defaults; mudar os nomes exige ajustar hook e
+configuração juntos. O Compose expõe uma instância HTTP; os testes provam três
+processos independentes compartilhando banco e filas.
