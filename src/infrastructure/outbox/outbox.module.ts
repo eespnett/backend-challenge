@@ -12,11 +12,13 @@ import { SqsService } from '../sqs/sqs.service';
 import { SqsEventTransport } from './sqs-event-transport';
 import { IntegrationEventConsumer } from './event-consumer';
 import { OutboxWorkers } from './outbox-workers';
+import { ObservabilityModule } from '../../observability/observability.module';
+import { TelemetryService } from '../../observability/telemetry.service';
 
-@Module({imports:[ConfigModule,PersistenceModule,SqsModule],providers:[
-  {provide:OutboxPublisher,inject:[MikroORM,SqsService,AppConfig],useFactory:(orm:MikroORM,sqs:SqsService,config:AppConfig)=>
-    new OutboxPublisher(new MikroOrmOutboxClaimStore(orm),new SqsEventTransport(sqs,config.outbox.queueName),`${process.pid}:${randomUUID()}`,config.outbox.leaseMs)},
-  {provide:IntegrationEventConsumer,inject:[MikroORM,SqsService],useFactory:(orm:MikroORM,sqs:SqsService)=>
-    new IntegrationEventConsumer(new MikroOrmEventReceiptStore(orm),sqs)},OutboxWorkers,
+@Module({imports:[ConfigModule,PersistenceModule,SqsModule,ObservabilityModule],providers:[
+  {provide:OutboxPublisher,inject:[MikroORM,SqsService,AppConfig,TelemetryService],useFactory:(orm:MikroORM,sqs:SqsService,config:AppConfig,telemetry:TelemetryService)=>
+    new OutboxPublisher(new MikroOrmOutboxClaimStore(orm),new SqsEventTransport(sqs,config.outbox.queueName),`${process.pid}:${randomUUID()}`,config.outbox.leaseMs,telemetry)},
+  {provide:IntegrationEventConsumer,inject:[MikroORM,SqsService,TelemetryService],useFactory:(orm:MikroORM,sqs:SqsService,telemetry:TelemetryService)=>
+    new IntegrationEventConsumer(new MikroOrmEventReceiptStore(orm),sqs,telemetry)},OutboxWorkers,
 ],exports:[OutboxPublisher,IntegrationEventConsumer]})
 export class OutboxModule{}

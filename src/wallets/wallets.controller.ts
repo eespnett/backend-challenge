@@ -1,7 +1,10 @@
-import { BadRequestException, Body, ConflictException, Controller, Inject, Post } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Headers, HttpCode, Inject, Param, Post, Query, ServiceUnavailableException } from '@nestjs/common';
+import { randomUUID } from 'node:crypto';
+import { QueryService } from '../queries/query.service';
 import { OpenWallet, OpenWalletInput } from '../application/open-wallet';
 import { WalletAlreadyExistsError } from '../application/financial-unit-of-work';
 import { DomainError } from '../domain/domain-error';
+import { InfrastructureUnavailableError } from '../application/processing-errors';
 
 function parseInput(body: unknown): OpenWalletInput {
   if (body === null || typeof body !== 'object' || Array.isArray(body)) {
@@ -22,7 +25,22 @@ function parseInput(body: unknown): OpenWalletInput {
 
 @Controller('wallets')
 export class WalletsController {
-  constructor(@Inject(OpenWallet) private readonly openWallet: OpenWallet) {}
+  constructor(@Inject(OpenWallet) private readonly openWallet: OpenWallet,
+    @Inject(QueryService) private readonly queries: QueryService) {}
+
+  @Get(':walletId')
+  get(@Param('walletId') walletId: string) { return this.queries.wallet(walletId); }
+
+  @Get(':walletId/ledger')
+  ledger(@Param('walletId') walletId: string, @Query('cursor') cursor: unknown, @Query('limit') limit: unknown) {
+    return this.queries.ledger(walletId, cursor, limit);
+  }
+
+  @Post(':walletId/reconciliation')
+  @HttpCode(200)
+  reconcile(@Param('walletId') walletId: string, @Headers('x-correlation-id') correlationId?: string) {
+    return this.queries.reconcile(walletId, correlationId ?? randomUUID());
+  }
 
   @Post()
   async open(@Body() body: unknown) {
@@ -35,6 +53,9 @@ export class WalletsController {
       }
       if (error instanceof DomainError) {
         throw new BadRequestException({ failureCode: error.code, message: error.message });
+      }
+      if (error instanceof InfrastructureUnavailableError) {
+        throw new ServiceUnavailableException({ failureCode: error.code, message: error.message });
       }
       throw error;
     }

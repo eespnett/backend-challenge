@@ -5,6 +5,7 @@ import { InfrastructureUnavailableError } from '../../application/processing-err
 import { MikroOrmWalletRepository, MikroOrmWagerTransactionRepository, MikroOrmLedgerRepository, MikroOrmOutboxRepository } from './repositories';
 import { MikroOrmPendingReferenceRepository } from './pending-reference-repository';
 import { MikroOrmInboxRepository } from './inbox-repository';
+import { silentTelemetry, TelemetryPort } from '../../application/telemetry-port';
 
 export function isTransientDatabaseError(error: unknown): boolean {
   if (!(error instanceof Error)) return false;
@@ -15,7 +16,7 @@ export function isTransientDatabaseError(error: unknown): boolean {
 }
 
 export class MikroOrmTransactionManager implements TransactionManager {
-  constructor(private readonly orm: MikroORM) {}
+  constructor(private readonly orm: MikroORM, private readonly telemetry: TelemetryPort = silentTelemetry) {}
   async run<T>(work: (repositories: FinancialUnitOfWork) => Promise<T>): Promise<T> {
     // Every invocation owns an isolated identity map and a single SQL transaction.
     try {
@@ -27,6 +28,11 @@ export class MikroOrmTransactionManager implements TransactionManager {
           outbox: new MikroOrmOutboxRepository(em), pendingReferences: new MikroOrmPendingReferenceRepository(em) });
       }, { isolationLevel: IsolationLevel.READ_COMMITTED });
     } catch (error) {
+      const code = (error as { code?: string })?.code;
+      if (code === '55P03' || code === '40P01' || code === '40001') {
+        this.telemetry.increment('lock_conflicts', 'database');
+        this.telemetry.log('warn', 'database_lock_conflict');
+      }
       if (isTransientDatabaseError(error)) throw new InfrastructureUnavailableError();
       throw error;
     }

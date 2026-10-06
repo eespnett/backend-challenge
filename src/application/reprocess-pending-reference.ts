@@ -7,14 +7,18 @@ import { FailureCode } from '../domain/failure-code';
 import { WagerTransactionStatus as Status } from '../domain/wager-transaction';
 import { LedgerDirection, WalletLedgerEntry } from '../domain/wallet-ledger-entry';
 import { IntegrationEvent, WalletBalanceChanged, WagerTransactionProcessed, WagerTransactionRejected } from '../domain/events';
+import { silentTelemetry, TelemetryPort, TraceContext } from './telemetry-port';
 
 export type PendingReferenceOutcome = 'STALE' | 'WAITING' | 'PROCESSED' | 'REJECTED' | 'EXPIRED';
 
 export class ReprocessPendingReferenceUseCase {
-  constructor(private readonly transactions: TransactionManager) {}
+  constructor(private readonly transactions: TransactionManager, private readonly telemetry: TelemetryPort = silentTelemetry) {}
 
-  execute(claim: PendingReferenceClaim): Promise<PendingReferenceOutcome> {
-    return this.transactions.run(async (uow) => {
+  async execute(claim: PendingReferenceClaim): Promise<PendingReferenceOutcome> {
+    const started = performance.now();
+    const trace: TraceContext = { walletId: claim.walletId, transactionId: claim.transactionId };
+    try {
+    const result: PendingReferenceOutcome = await this.transactions.run(async (uow) => {
       // Wallet first: a worker waiting here cannot retain a job row lock after lease expiry.
       const wallet = await uow.wallets.lockById(claim.walletId);
       if (wallet === undefined) throw new Error('Pending reference wallet is missing');
@@ -22,6 +26,7 @@ export class ReprocessPendingReferenceUseCase {
       if (job === undefined) return 'STALE';
       const tx = await uow.transactions.findById(claim.transactionId);
       if (tx === undefined || tx.walletId !== wallet.id) throw new Error('Invalid pending reference identity');
+      Object.assign(trace, { providerId: tx.providerId, correlationId: job.correlationId, messageId: job.causationId });
       if (tx.status !== Status.PendingReference) {
         await uow.pendingReferences.finish(job, false);
         return 'STALE';
@@ -61,5 +66,13 @@ export class ReprocessPendingReferenceUseCase {
       await uow.pendingReferences.finish(job, expired);
       return expired ? 'EXPIRED' : decision.outcome === 'REJECT' ? 'REJECTED' : 'PROCESSED';
     });
+    if (result === 'WAITING') this.telemetry.increment('retries_total', 'pending');
+    this.telemetry.log('info', `pending_reference_${result.toLowerCase()}`, trace);
+    return result;
+    } catch (error) {
+      this.telemetry.increment('retries_total', 'pending');
+      this.telemetry.log('warn', 'pending_reference_retry', trace);
+      throw error;
+    } finally { this.telemetry.latency((performance.now() - started) / 1000, 'pending'); }
   }
 }

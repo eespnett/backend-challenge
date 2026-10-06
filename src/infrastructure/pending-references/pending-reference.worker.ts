@@ -1,16 +1,17 @@
-import { Inject, Injectable, Logger, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, OnApplicationBootstrap, OnModuleDestroy } from '@nestjs/common';
+import { TelemetryService } from '../../observability/telemetry.service';
 import { AppConfig } from '../../config/app-config';
 import { RunPendingReferenceBatch } from '../../application/run-pending-reference-batch';
 import { PENDING_REFERENCE_POLL_MS } from '../../application/pending-reference-schedule';
 
 @Injectable()
 export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleDestroy {
-  private readonly logger = new Logger(PendingReferenceWorker.name);
   private timer: ReturnType<typeof setInterval> | undefined;
   private active: Promise<void> | undefined;
   private stopping = false;
   constructor(@Inject(AppConfig) private readonly config: AppConfig,
-    @Inject(RunPendingReferenceBatch) private readonly batch: RunPendingReferenceBatch) {}
+    @Inject(RunPendingReferenceBatch) private readonly batch: RunPendingReferenceBatch,
+    @Inject(TelemetryService) private readonly telemetry: TelemetryService) {}
 
   onApplicationBootstrap() {
     if (!this.config.pendingReferenceWorkerEnabled) return;
@@ -24,10 +25,10 @@ export class PendingReferenceWorker implements OnApplicationBootstrap, OnModuleD
       try {
         const results = await this.batch.execute();
         if (results.some((result) => result.status === 'rejected')) {
-          this.logger.warn('Pending reference attempt failed; persisted lease will allow recovery');
+          this.telemetry.log('warn', 'pending_reference_attempt_failed');
         }
       } catch {
-        this.logger.warn('Pending reference claim unavailable; next poll will retry');
+        this.telemetry.log('warn', 'pending_reference_poll_unavailable');
       }
     })();
     try { await this.active; } finally { this.active = undefined; }

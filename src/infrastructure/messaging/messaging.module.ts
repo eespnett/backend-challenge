@@ -8,10 +8,12 @@ import { SqsService } from '../sqs/sqs.service';
 import { WageringModule } from '../../wagering/wagering.module';
 import { WagerConsumer } from './wager-consumer';
 import { WagerWorker } from './wager-worker';
+import { ObservabilityModule } from '../../observability/observability.module';
+import { TelemetryService } from '../../observability/telemetry.service';
 
-@Module({ imports: [ConfigModule, PersistenceModule, SqsModule, WageringModule], providers: [
-  { provide: WagerConsumer, inject: [TRANSACTION_MANAGER, ProcessWagerTransactionUseCase, SqsService],
-    useFactory: (manager: TransactionManager, process: ProcessWagerTransactionUseCase, sqs: SqsService) => new WagerConsumer(manager, process, sqs) },
+@Module({ imports: [ConfigModule, PersistenceModule, SqsModule, WageringModule, ObservabilityModule], providers: [
+  { provide: WagerConsumer, inject: [TRANSACTION_MANAGER, ProcessWagerTransactionUseCase, SqsService, TelemetryService],
+    useFactory: (manager: TransactionManager, process: ProcessWagerTransactionUseCase, sqs: SqsService, telemetry: TelemetryService) => new WagerConsumer(manager, process, sqs, telemetry) },
   WagerWorker,
 ], exports: [WagerConsumer] })
 export class MessagingModule {}

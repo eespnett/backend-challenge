@@ -8,12 +8,32 @@ import { TransactionManager, FinancialUnitOfWork } from './financial-unit-of-wor
 import { RecordedSubmission, StoredProcessingResult } from './processing-result';
 import { InfrastructureUnavailableError, InvalidWagerRequestError, ProcessingConflictError, SubmissionUniquenessCollision } from './processing-errors';
 import { requestText, validateWagerRequest, wagerPayloadHash, ValidatedWagerRequest } from './wager-request';
+import { silentTelemetry, TelemetryPort, TraceContext } from './telemetry-port';
 
 export class ProcessWagerTransactionUseCase {
-  constructor(private readonly transactions: TransactionManager) {}
+  constructor(private readonly transactions: TransactionManager, private readonly telemetry: TelemetryPort = silentTelemetry) {}
 
   async execute(body: unknown, key: unknown, context: { correlationId?: string; causationId?: string } = {}): Promise<StoredProcessingResult> {
-    return this.process(body, key, context);
+    const started = performance.now();
+    const correlationId = context.correlationId ?? randomUUID();
+    const trace: TraceContext = { correlationId };
+    try {
+      const request = validateWagerRequest(body, key);
+      Object.assign(trace, { walletId: request.walletId, providerId: request.providerId });
+      const result = await this.process(body, key, { ...context, correlationId });
+      this.recordCommitted(result, trace, 'http');
+      return result;
+    } catch (error) {
+      this.telemetry.log('warn', 'transaction_submission_failed', trace);
+      throw error;
+    } finally { this.telemetry.latency((performance.now() - started) / 1000, 'http'); }
+  }
+
+  /** Called by SQS only AFTER the caller's inbox/financial transaction commits. */
+  recordCommitted(result: StoredProcessingResult, context: TraceContext, source: 'http' | 'sqs'): void {
+    if (result.body.idempotentReplay) this.telemetry.increment('duplicates_detected', source);
+    this.telemetry.log('info', result.body.idempotentReplay ? 'transaction_replayed' : 'transaction_committed',
+      { ...context, transactionId: result.body.transactionId });
   }
 
   /** The caller owns commit/rollback (e.g. inbox + financial effects). No nested transaction. */

@@ -1,4 +1,5 @@
-import { Inject, Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { TelemetryService } from '../../observability/telemetry.service';
 import { ReceiveMessageCommand } from '@aws-sdk/client-sqs';
 import { AppConfig } from '../../config/app-config';
 import { SqsService } from '../sqs/sqs.service';
@@ -6,13 +7,13 @@ import { WagerConsumer, SQS_VISIBILITY_SECONDS } from './wager-consumer';
 
 @Injectable()
 export class WagerWorker implements OnModuleInit, OnModuleDestroy {
-  private readonly logger = new Logger(WagerWorker.name);
   private readonly polling = new AbortController();
   private readonly deliveries = new AbortController();
   private running?: Promise<void>;
   private stopping = false;
   constructor(@Inject(AppConfig) private readonly config: AppConfig, @Inject(SqsService) private readonly sqs: SqsService,
-    @Inject(WagerConsumer) private readonly consumer: WagerConsumer) {}
+    @Inject(WagerConsumer) private readonly consumer: WagerConsumer,
+    @Inject(TelemetryService) private readonly telemetry: TelemetryService) {}
 
   onModuleInit(): void { if (this.config.messaging.enabled) this.running = this.poll(); }
   private async poll(): Promise<void> {
@@ -44,7 +45,7 @@ export class WagerWorker implements OnModuleInit, OnModuleDestroy {
         }
       } catch {
         if (this.stopping) break;
-        this.logger.warn('SQS polling unavailable; retrying');
+        this.telemetry.log('warn', 'sqs_poll_unavailable');
         await new Promise<void>((resolve) => {
           const timer = setTimeout(done, 1000);
           const signal = this.polling.signal;

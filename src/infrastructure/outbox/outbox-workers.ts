@@ -1,4 +1,5 @@
-import { Inject, Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { Inject, Injectable, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
+import { TelemetryService } from '../../observability/telemetry.service';
 import { ReceiveMessageCommand } from '@aws-sdk/client-sqs';
 import { AppConfig } from '../../config/app-config';
 import { OutboxPublisher } from '../../application/outbox-publisher';
@@ -8,13 +9,13 @@ import { IntegrationEventConsumer } from './event-consumer';
 /** Independent loops: consumer failure cannot block publication of durable events. */
 @Injectable()
 export class OutboxWorkers implements OnModuleInit,OnModuleDestroy {
-  private readonly logger=new Logger(OutboxWorkers.name);
   private readonly polling=new AbortController();
   private readonly work=new AbortController();
   private stopping=false;
   private tasks:Promise<void>[]=[];
   constructor(@Inject(AppConfig)private readonly config:AppConfig,@Inject(OutboxPublisher)private readonly publisher:OutboxPublisher,
-    @Inject(IntegrationEventConsumer)private readonly consumer:IntegrationEventConsumer,@Inject(SqsService)private readonly sqs:SqsService){}
+    @Inject(IntegrationEventConsumer)private readonly consumer:IntegrationEventConsumer,@Inject(SqsService)private readonly sqs:SqsService,
+    @Inject(TelemetryService)private readonly telemetry:TelemetryService){}
   onModuleInit():void{
     if(this.config.outbox.publisherEnabled)this.tasks.push(this.publishLoop());
     if(this.config.outbox.consumerEnabled)this.tasks.push(this.consumeLoop());
@@ -30,7 +31,7 @@ export class OutboxWorkers implements OnModuleInit,OnModuleDestroy {
   }
   private async publishLoop():Promise<void>{
     while(!this.stopping){
-      try{await this.publisher.run(this.work.signal);}catch{if(!this.stopping)this.logger.warn('Outbox publication unavailable; durable events remain pending');}
+      try{await this.publisher.run(this.work.signal);}catch{if(!this.stopping)this.telemetry.log('warn','outbox_poll_unavailable');}
       await this.pause();
     }
   }
@@ -41,7 +42,7 @@ export class OutboxWorkers implements OnModuleInit,OnModuleDestroy {
         const batch=await this.sqs.client.send(new ReceiveMessageCommand({QueueUrl,WaitTimeSeconds:2,MaxNumberOfMessages:5,
           VisibilityTimeout:30}),{abortSignal:this.polling.signal});
         for(const message of batch.Messages??[]){if(this.stopping)break;await this.consumer.handle(message,QueueUrl,this.work.signal);}
-      }catch{if(!this.stopping){this.logger.warn('Event receipt consumer unavailable; retrying');await this.pause();}}
+      }catch{if(!this.stopping){this.telemetry.log('warn','event_poll_unavailable');await this.pause();}}
     }
   }
   async onModuleDestroy():Promise<void>{

@@ -8,9 +8,12 @@ import { TRANSACTION_MANAGER } from '../../application/financial-unit-of-work';
 import { MikroOrmTransactionManager } from './mikro-orm-transaction-manager';
 import { PENDING_REFERENCE_CLAIM_STORE } from '../../application/pending-reference-ports';
 import { MikroOrmPendingReferenceClaimStore } from './pending-reference-repository';
+import { ObservabilityModule } from '../../observability/observability.module';
+import { TelemetryService } from '../../observability/telemetry.service';
 
 @Module({
   imports: [
+    ObservabilityModule,
     MikroOrmModule.forRootAsync({
       driver: PostgreSqlDriver,
       imports: [ConfigModule],
@@ -18,8 +21,8 @@ import { MikroOrmPendingReferenceClaimStore } from './pending-reference-reposito
       useFactory: (config: AppConfig) => createOrmConfig(config),
     }),
   ],
-  providers: [{ provide: TRANSACTION_MANAGER, inject: [MikroORM],
-    useFactory: (orm: MikroORM) => new MikroOrmTransactionManager(orm) },
+  providers: [{ provide: TRANSACTION_MANAGER, inject: [MikroORM, TelemetryService],
+    useFactory: (orm: MikroORM, telemetry: TelemetryService) => new MikroOrmTransactionManager(orm, telemetry) },
     { provide: PENDING_REFERENCE_CLAIM_STORE, inject: [MikroORM],
       useFactory: (orm: MikroORM) => new MikroOrmPendingReferenceClaimStore(orm) }],
   exports: [TRANSACTION_MANAGER, PENDING_REFERENCE_CLAIM_STORE],

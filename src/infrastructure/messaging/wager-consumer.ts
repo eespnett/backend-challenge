@@ -6,6 +6,8 @@ import { messageIdentity, MessageProtocolError, sha256, validateWagerEnvelope } 
 import { WAGER_CONSUMER } from '../../application/inbox-ports';
 import { DomainError } from '../../domain/domain-error';
 import { SqsService } from '../sqs/sqs.service';
+import { silentTelemetry, TelemetryPort, TraceContext } from '../../application/telemetry-port';
+import { StoredProcessingResult } from '../../application/processing-result';
 
 export const SQS_VISIBILITY_SECONDS = 30;
 export const SQS_MAX_RECEIVE_COUNT = 5;
@@ -14,7 +16,7 @@ export type DeliveryOutcome = 'ACK' | 'DLQ' | 'RETRY' | 'ABANDONED';
 
 export class WagerConsumer {
   constructor(private readonly transactions: TransactionManager, private readonly process: ProcessWagerTransactionUseCase,
-    private readonly sqs: SqsService) {}
+    private readonly sqs: SqsService, private readonly telemetry: TelemetryPort = silentTelemetry) {}
 
   async handle(message: Message, queueUrl: string, dlqUrl: string, signal: AbortSignal = new AbortController().signal): Promise<DeliveryOutcome> {
     const receipt = message.ReceiptHandle;
@@ -22,6 +24,8 @@ export class WagerConsumer {
     if (!receipt || !transportId) throw new Error('SQS delivery has no identity/receipt');
     const raw = message.Body ?? '';
     const identity = messageIdentity(raw, transportId);
+    const started = performance.now();
+    const trace: TraceContext = { messageId: identity.messageId, correlationId: identity.messageId };
     const checkStopped = () => { if (signal.aborted) throw new Error('Delivery shutdown deadline exceeded'); };
     let renewing: Promise<unknown> | undefined;
     const timer = setInterval(() => {
@@ -37,14 +41,20 @@ export class WagerConsumer {
       let permanent: string | undefined;
       try {
         const envelope = validateWagerEnvelope(raw);
+        Object.assign(trace, { walletId: envelope.body.walletId, providerId: envelope.body.providerId });
         // A uniqueness loser rolls back inbox AND financial state, then starts fresh.
         for (let attempt = 0; ; attempt++) {
+          let committed: StoredProcessingResult | undefined;
+          let inboxReplay = false;
           try {
             await this.transactions.run(async (uow) => {
               checkStopped();
               const record = await uow.inbox.reserve(identity.messageId, identity.hash);
               if (record.payloadHash !== identity.hash) throw new MessageProtocolError('MESSAGE_ID_CONFLICT');
               if (record.status !== 'RECEIVED') {
+                inboxReplay = true;
+                if (record.result && 'body' in record.result) committed = { ...record.result,
+                  body: { ...record.result.body, idempotentReplay: true } };
                 const code = record.result && 'errorCode' in record.result ? record.result.errorCode : undefined;
                 if (code === 'INVALID_ENVELOPE' || code === 'INVALID_PAYLOAD' || code === 'MESSAGE_ID_CONFLICT') throw new MessageProtocolError(code);
                 return;
@@ -53,6 +63,7 @@ export class WagerConsumer {
                 const result = await this.process.executeInTransaction(uow, envelope.body, envelope.idempotencyKey,
                   { correlationId: identity.messageId, causationId: identity.messageId });
                 await uow.inbox.finish(identity.messageId, identity.hash, result);
+                committed = result;
               } catch (error) {
                 // Persisted business/identity conflicts need no transport retry or duplicate financial effects.
                 if (!(error instanceof ProcessingConflictError)) throw error;
@@ -60,6 +71,10 @@ export class WagerConsumer {
               }
               checkStopped();
             });
+            if (committed) {
+              trace.transactionId = committed.body.transactionId;
+              this.process.recordCommitted(committed, trace, 'sqs');
+            } else if (inboxReplay) this.telemetry.increment('duplicates_detected', 'sqs');
             break;
           } catch (error) {
             if (!(error instanceof SubmissionUniquenessCollision) || attempt >= 1) throw error;
@@ -93,6 +108,7 @@ export class WagerConsumer {
           if (!sent.MessageId) throw new Error('DLQ send was not confirmed');
           checkStopped();
           await this.transactions.run(async (uow) => { await uow.inbox.markDeadLetterSent(identity.messageId, identity.hash); checkStopped(); });
+          this.telemetry.log('warn', 'message_sent_to_dlq', trace);
         }
       }
       // No SQL transaction remains open here; every durable effect already committed.
@@ -106,6 +122,8 @@ export class WagerConsumer {
       clearInterval(timer);
       await renewing;
       if (signal.aborted) return 'ABANDONED';
+      this.telemetry.increment('retries_total', 'sqs');
+      this.telemetry.log('warn', 'message_retry', trace);
       const receives = Number(message.Attributes?.ApproximateReceiveCount ?? '1');
       try {
         await this.sqs.client.send(new ChangeMessageVisibilityCommand({ QueueUrl: queueUrl, ReceiptHandle: receipt,
@@ -117,6 +135,7 @@ export class WagerConsumer {
       clearInterval(timer);
       signal.removeEventListener('abort', abortRenewal);
       await renewing;
+      this.telemetry.latency((performance.now() - started) / 1000, 'sqs');
     }
   }
 }

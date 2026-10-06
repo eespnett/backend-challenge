@@ -1,9 +1,10 @@
 import { EventTransport, OutboxClaim, OutboxClaimStore, outboxBackoffMs } from './outbox-ports';
+import { silentTelemetry, TelemetryPort, TraceContext } from './telemetry-port';
 
 export type PublishOutcome = 'PUBLISHED' | 'RETRY' | 'STALE' | 'ABANDONED';
 export class OutboxPublisher {
   constructor(private readonly store: OutboxClaimStore, private readonly transport: EventTransport,
-    private readonly owner: string, private readonly leaseMs = 30000) {}
+    private readonly owner: string, private readonly leaseMs = 30000, private readonly telemetry: TelemetryPort = silentTelemetry) {}
 
   async run(signal: AbortSignal = new AbortController().signal): Promise<readonly PublishOutcome[]> {
     if (signal.aborted) return [];
@@ -15,6 +16,9 @@ export class OutboxPublisher {
     return results.map((result)=>(result as PromiseFulfilledResult<PublishOutcome>).value);
   }
   private async publish(claim: OutboxClaim, parent: AbortSignal): Promise<PublishOutcome> {
+    const data = claim.payload.data as Record<string, unknown> | undefined;
+    const trace = { correlationId: claim.payload.correlationId, messageId: claim.eventId,
+      transactionId: data?.transactionId, walletId: data?.walletId, providerId: data?.providerId } as TraceContext;
     if (parent.aborted) return 'ABANDONED';
     const delivery = new AbortController();
     const abort = () => delivery.abort();
@@ -37,14 +41,21 @@ export class OutboxPublisher {
       await renewal;
       if (parent.aborted) return 'ABANDONED';
       if (stale || delivery.signal.aborted) return 'STALE';
-      return await this.store.published(claim) ? 'PUBLISHED' : 'STALE';
+      const published = await this.store.published(claim);
+      if (published) this.telemetry.log('info', 'outbox_published', trace);
+      return published ? 'PUBLISHED' : 'STALE';
     } catch {
       clearInterval(timer);
       await renewal;
       if (parent.aborted) return 'ABANDONED';
       if (stale || delivery.signal.aborted) return 'STALE';
       // Even persistent failures stay pending; retry never deletes or invents an event.
-      return await this.store.retry(claim,sent?'PUBLICATION_CONFIRMATION_FAILED':'SQS_SEND_FAILED',outboxBackoffMs(claim.attempts)) ? 'RETRY' : 'STALE';
+      const retried = await this.store.retry(claim,sent?'PUBLICATION_CONFIRMATION_FAILED':'SQS_SEND_FAILED',outboxBackoffMs(claim.attempts));
+      if (retried) {
+        this.telemetry.increment('retries_total', 'outbox');
+        this.telemetry.log('warn', 'outbox_retry', trace);
+      }
+      return retried ? 'RETRY' : 'STALE';
     } finally {
       clearInterval(timer); parent.removeEventListener('abort',abort);
       await renewal;

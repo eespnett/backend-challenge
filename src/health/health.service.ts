@@ -14,8 +14,8 @@ export class HealthService {
     checks: { postgres: 'up' | 'down'; sqs: 'up' | 'down' };
   }> {
     const [postgres, sqs] = await Promise.allSettled([
-      this.orm.em.getConnection().execute('select 1 as ok'),
-      this.sqs.check(),
+      this.bounded(this.orm.em.getConnection().execute('select 1 as ok')),
+      this.bounded(this.sqs.check()),
     ]);
     const checks = {
       postgres: postgres.status === 'fulfilled' ? 'up' as const : 'down' as const,
@@ -25,5 +25,14 @@ export class HealthService {
       status: checks.postgres === 'up' && checks.sqs === 'up' ? 'ok' : 'unavailable',
       checks,
     };
+  }
+
+  private async bounded<T>(probe: Promise<T>): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([probe, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Readiness deadline')), 6000);
+      })]);
+    } finally { clearTimeout(timer); }
   }
 }

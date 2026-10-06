@@ -1,4 +1,4 @@
-# Arquitetura — Fases 0, 1, 2, 3, 4 e 5
+# Arquitetura — Fases 0 a 8
 
 ## Escopo implementado
 
@@ -11,7 +11,10 @@ idempotência persistente, resposta original e outbox na mesma transação SQL.
 A Fase 4 testa concorrência HTTP com três processos Bun independentes, restart,
 stress controlado e locks observados diretamente no PostgreSQL.
 A Fase 5 resolve referências pendentes com worker periódico, agendamento e
-claim/lease persistidos. Ainda não há autenticação, consumidor SQS, inbox ou publisher.
+claim/lease persistidos. A Fase 6 acrescenta inbox, consumidor SQS e DLQ;
+a Fase 7 publica a outbox com lease persistente e consumidor mínimo de eventos.
+A Fase 8 acrescenta consultas, reconciliação e observabilidade mínima.
+Autenticação real permanece fora do escopo atual.
 
 A migration 20261005000000 cria o schema wagering; 20261005020000 cria as três
 tabelas financeiras, constraints, índices e proteção do ledger. A migration
@@ -675,6 +678,117 @@ Todos os cenários reconciliam saldo exatamente com o ledger e verificam outbox
 sem publicação. TTL/lease são envelhecidos por SQL nas fixtures para não esperar
 15 minutos/30 segundos; a produção usa os prazos completos persistidos.
 
-Consumidor SQS, inbox, DLQ funcional, publisher, autenticação e observabilidade
-completa permanecem para fases futuras. A resolução é periódica e pode aguardar
-o backoff de até 30s; não existe notificação imediata pela chegada da referência.
+O consumidor SQS, inbox e DLQ estão documentados em [Fase 6](docs/phase-6-messaging.md);
+o publisher e consumidor mínimo de eventos em [Fase 7](docs/phase-7-outbox.md).
+A resolução de referências é periódica e pode aguardar o backoff de até 30s;
+não existe notificação imediata pela chegada da referência.
+
+## Fase 8 — consultas, reconciliação e observabilidade
+
+Consultas HTTP, sem efeitos financeiros:
+
+| Endpoint | Resposta |
+| --- | --- |
+| `GET /wallets/:walletId` | Identidade, balance `{amount,currency}`, versão e timestamps |
+| `GET /wallets/:walletId/ledger?cursor=...&limit=50` | `{items,nextCursor}`; movimentos com valores decimais e timestamps |
+| `GET /wagering/transactions/:transactionId` | Estado atual da transação e referências |
+| `GET /providers/:providerId/wagering/transactions/:externalTransactionId` | Mesmo contrato, lookup por identidade externa escopada ao provider |
+| `POST /wallets/:walletId/reconciliation` | `{walletId,storedBalance,calculatedBalance,difference,consistent,checkedEntries}`; HTTP 200 |
+| `GET /metrics` | Formato texto Prometheus 0.0.4 |
+
+As consultas de transação retornam estado atual, sem idempotency key, hash ou
+resultado HTTP original interno. O replay do POST continua retornando o resultado
+original persistido. Valores financeiros permanecem strings decimais exatas.
+Recursos ausentes (inclusive UUID malformado) retornam 404. Cursor/limite inválido
+retorna 400; falha de infraestrutura de consulta retorna 503 sem erro SQL bruto.
+
+### Cursor e histórico
+
+O ledger usa keyset pagination em ordem decrescente `(created_at,id)`, com
+comparação estrita `<` e busca de `limit+1` para determinar a próxima página.
+Padrão 50, máximo 100, mínimo 1. O cursor é um token base64url opaco para clientes,
+versionado, escopado à wallet, validado antes de acessar o banco e não autenticado.
+O timestamp UTC preserva seis casas de microssegundos; UUID desempata timestamps
+iguais. O índice `ledger_wallet_history_idx` já existente atende ao percurso.
+Não há offset, nem modificação/deleção de entradas durante a paginação.
+
+Cada página lê seu próprio snapshot. Inserções mais recentes que o cursor não
+deslocam nem duplicam as entradas já percorridas. Não se promete um snapshot
+congelado entre requisições: uma inserção commitada posteriormente com timestamp
+anterior ao cursor pode aparecer nas páginas seguintes. O cliente deve tratar
+o token como opaco e usar `nextCursor=null` como fim do percurso.
+
+### Reconciliação
+
+Uma única instrução SQL lê a wallet e agrega seu ledger no mesmo snapshot MVCC
+do PostgreSQL. Soma créditos menos débitos, incluindo OPENING; ledger vazio soma
+zero. A operação usa uma transação somente de leitura, com statement timeout de
+5s e sem lock de wallet. Escrita concorrente ainda não commitada é invisível tanto
+para saldo quanto para ledger; não existe leitura parcial de uma transação.
+
+`storedBalance`, `calculatedBalance` e `difference` usam `{amount,currency}`;
+`difference = storedBalance - calculatedBalance`, podendo ser negativo.
+`checkedEntries` inclui todas as entradas dessa wallet no snapshot. Não há
+arredondamento via Number, correção automática ou mudança do histórico.
+Divergência emite `reconciliation_inconsistent` e incrementa
+`reconciliation_inconsistencies{source="reconciliation"}` a cada detecção.
+
+### Logs e métricas
+
+Logs da aplicação são JSON por linha. Campos permitidos: `timestamp`, `level`,
+`event` e, quando conhecidos, `correlationId`, `messageId`, `transactionId`,
+`walletId`, `providerId`. Não são serializados bodies, payloads financeiros,
+valores de saldo, headers de autorização, credenciais, nem erros brutos SQL/SDK.
+O interceptor HTTP propaga/gera `x-correlation-id`, retorna esse header e registra
+conclusão/falha sem URL/query/body. Processamento registra commit/replay após
+confirmação SQL; SQS registra isso após commit conjunto de inbox e efeitos.
+Eventos de retry e publicação usam os identificadores persistidos. Logs internos
+do Nest recebem eventos genéricos via `JsonLogger`; workers usam eventos nomeados.
+
+| Métrica | Semântica |
+| --- | --- |
+| `transactions_by_status{status}` | Gauge SQL do estado atual, incluindo OPENING; não conta tentativas revertidas |
+| `duplicates_detected{source}` | Counter de replays confirmados HTTP, inbox SQS ou recibos de eventos |
+| `retries_total{source}` | Counter de retries SQS, outbox e resolução de referência |
+| `dlq_messages` | Gauge aproximado SQS: mensagens visíveis + em voo na DLQ, incluindo redrive nativo |
+| `lock_conflicts{source="database"}` | Counter de SQLSTATE 55P03, 40P01 ou 40001 no transaction manager |
+| `outbox_lag` | Gauge em segundos da idade do evento mais antigo ainda não publicado; zero quando vazia |
+| `processing_latency` | Histograma em segundos com buckets, count e sum, por origem HTTP/SQS/pending |
+| `reconciliation_inconsistencies{source}` | Counter de divergências detectadas, sem reparo |
+
+Counters/histogramas vivem por processo e reiniciam com ele. Scrape cada instância
+para observar seus contadores; gauges SQL/SQS representam estado compartilhado
+e não devem ser somados entre réplicas. Labels têm vocabulário fixo; IDs nunca são
+labels. Não há histórico de métricas persistido, agregador, dashboard ou OTel.
+Falha nas dependências de `/metrics` retorna 503, sem apresentar gauge zero falso.
+
+### Health e identidade
+
+`/health/live` confirma que o processo HTTP está vivo e não consulta dependências.
+`/health/ready` executa `SELECT 1` e verifica acesso às três filas configuradas
+em paralelo. Cada probe tem deadline de 6s; o SDK também tem timeouts/abort.
+Retorna 200 com `checks.postgres=up` e `checks.sqs=up`, ou 503 com a dependência
+indisponível marcada `down`, sem mensagens internas. Liveness permanece 200
+durante uma falha de dependência após o bootstrap.
+
+`ProviderIdentityPort.assertProviderAccess(providerId,authorization?)` é chamado
+na submissão HTTP e na consulta por provider. O binding atual é explicitamente
+`NoopProviderIdentityAdapter`: aceita sem validar token ou aplicar autorização.
+O ponto futuro de OIDC é substituir esse binding por um adapter que valide
+assinatura/JWKS, issuer, audience, expiração e vínculo do provider com os claims;
+o header recebido não é registrado. Isso ainda não constitui autenticação real.
+
+### Verificação da Fase 8
+
+```sh
+bun run typecheck
+bun test test/unit test/smoke
+bun test test/integration --timeout 30000
+bun test test/concurrency --timeout 30000
+```
+
+Os testes específicos cobrem consultas, cursor com empate de microssegundos,
+inserção entre páginas, erros HTTP, reconciliação consistente/divergente sem
+reparo, snapshot durante escrita parcial e commits concorrentes, timeout real
+de lock, replays/retries/DLQ observáveis, logs sem payload/credenciais e health
+com dependências disponíveis/indisponíveis. Bancos e filas de teste são isolados.

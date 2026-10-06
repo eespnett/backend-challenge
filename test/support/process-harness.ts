@@ -89,7 +89,8 @@ export async function processHarness(instanceCount = 3, options: { pendingWorker
     try {
       const info = await withDeadline(ready.promise, 15000, 'application process bootstrap');
       const instance = { ...info, child, drain: draining, diagnostics: () => log };
-      const response = await fetch(`${info.url}/health/ready`, { signal: AbortSignal.timeout(5000) });
+      // Must exceed the readiness service's 6s probe deadline so a 503 can be observed.
+      const response = await fetch(`${info.url}/health/ready`, { signal: AbortSignal.timeout(8000) });
       if (!response.ok) throw new Error(`Child readiness returned ${response.status}`);
       return instance;
     } catch (error) {
